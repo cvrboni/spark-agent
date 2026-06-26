@@ -26,6 +26,7 @@ class VLLMClientConfig:
     connect_timeout_s: float = 10.0
     temperature: float = 0.0
     max_tokens: int = 2048
+    max_tool_result_chars: int = 6_000
 
     @property
     def chat_completions_url(self) -> str:
@@ -125,8 +126,13 @@ class AgentExecutor:
             )
             response.raise_for_status()
             return response.json()
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            raise VLLMRequestError(f"vLLM request failed: {exc}") from exc
+        except httpx.TimeoutException as exc:
+            raise VLLMRequestError(
+                f"vLLM request timed out after {self.config.timeout_s:g}s ({type(exc).__name__})"
+            ) from exc
+        except httpx.NetworkError as exc:
+            detail = str(exc) or type(exc).__name__
+            raise VLLMRequestError(f"vLLM network error: {detail}") from exc
         except httpx.HTTPStatusError as exc:
             body = exc.response.text[:1000]
             raise VLLMRequestError(
@@ -191,7 +197,7 @@ class AgentExecutor:
             self.prompt_engine.append_tool_result(
                 tool_call_id=tool_call_id,
                 name=name,
-                content=result,
+                content=self._truncate_tool_result(result),
             )
 
     @staticmethod
@@ -206,3 +212,19 @@ class AgentExecutor:
             if isinstance(decoded, dict):
                 return decoded
         raise ValueError("tool arguments must be a JSON object")
+
+    def _truncate_tool_result(self, result: JsonValue | str) -> JsonValue | str:
+        max_chars = max(500, self.config.max_tool_result_chars)
+        if isinstance(result, str):
+            if len(result) <= max_chars:
+                return result
+            return f"{result[:max_chars]}\n...[tool output truncated to {max_chars} chars]"
+
+        rendered = json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if len(rendered) <= max_chars:
+            return result
+        return {
+            "truncated": True,
+            "max_chars": max_chars,
+            "preview": rendered[:max_chars],
+        }

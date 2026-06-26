@@ -111,6 +111,21 @@ def test_executor_accepts_reasoning_alias_from_vllm() -> None:
     assert turn.reasoning_content == "hidden trace"
 
 
+def test_executor_truncates_large_tool_results() -> None:
+    prompt = PromptEngine(static_blocks=[PromptBlock("system", "stable")])
+    executor = AgentExecutor(
+        prompt_engine=prompt,
+        config=VLLMClientConfig(max_tool_result_chars=500),
+        client=FakeClient({"choices": [{"message": {"content": "ok"}}]}),  # type: ignore[arg-type]
+    )
+
+    result = executor._truncate_tool_result({"payload": "x" * 2000})
+
+    assert isinstance(result, dict)
+    assert result["truncated"] is True
+    assert len(result["preview"]) <= 500
+
+
 @pytest.mark.asyncio
 async def test_executor_sends_bearer_auth_header() -> None:
     prompt = PromptEngine(static_blocks=[PromptBlock("system", "stable")])

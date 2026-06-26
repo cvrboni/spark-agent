@@ -13,8 +13,8 @@ type JsonObject = dict[str, Any]
 type JsonArray = list[JsonObject]
 
 
-DEFAULT_MAX_MATCHES = 50
-DEFAULT_CONTEXT_LINES = 2
+DEFAULT_MAX_MATCHES = 10
+DEFAULT_CONTEXT_LINES = 1
 DEFAULT_MAX_BYTES = 24_000
 
 

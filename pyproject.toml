@@ -1,0 +1,54 @@
+[project]
+name = "spark-agent"
+version = "0.1.0"
+description = "Minimal cache-stable AI agent framework optimized for local vLLM clusters."
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+authors = [
+  { name = "SparkAgent contributors" },
+]
+keywords = ["agents", "vllm", "hpc", "llm", "prefix-cache", "deepseek"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+  "httpx>=0.27.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/cvrboni/spark-agent"
+Repository = "https://github.com/cvrboni/spark-agent"
+Issues = "https://github.com/cvrboni/spark-agent/issues"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.0",
+  "ruff>=0.6.0",
+]
+
+[project.scripts]
+spark-agent = "spark_agent.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["ASYNC", "B", "E", "F", "I", "N", "PERF", "RUF", "UP", "W"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"

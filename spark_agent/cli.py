@@ -117,12 +117,31 @@ async def doctor(args: argparse.Namespace) -> int:
 
 
 def init_config(args: argparse.Namespace) -> int:
+    config_path = Path(args.config) if args.config else default_config_path()
+    existing = SparkAgentConfig.from_file(config_path) if config_path.exists() else SparkAgentConfig()
+    requested_config = SparkAgentConfig(
+        base_url=args.base_url or existing.base_url,
+        model=args.model or existing.model,
+        language=args.language or existing.language,
+        api_key_env=existing.api_key_env,
+        timeout_s=existing.timeout_s,
+        max_tokens=existing.max_tokens,
+        repo_context_budget=existing.repo_context_budget,
+        prefer_local_tools=existing.prefer_local_tools,
+    )
+    has_explicit_updates = args.base_url is not None or args.model is not None or args.language is not None
+    should_write = args.force or has_explicit_updates or not config_path.exists()
+    if not should_write:
+        print(f"Config already exists: {config_path}")
+        print("Use --force or pass --base-url/--model/--language to update it.")
+        return 0
+
     path = write_default_config(
-        Path(args.config) if args.config else None,
-        base_url=args.base_url,
-        model=args.model,
-        language=args.language,
-        force=args.force,
+        config_path,
+        base_url=requested_config.base_url,
+        model=requested_config.model,
+        language=requested_config.language,
+        force=True,
     )
     print(f"Wrote config: {path}")
     return 0
@@ -144,9 +163,9 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=False)
 
     init = subparsers.add_parser("init", help="Create a local config file.")
-    init.add_argument("--base-url", default="http://localhost:8000/v1")
-    init.add_argument("--model", default="deepseek-v4-flash")
-    init.add_argument("--language", choices=["auto", "it", "en"], default="auto")
+    init.add_argument("--base-url")
+    init.add_argument("--model")
+    init.add_argument("--language", choices=["auto", "it", "en"])
     init.add_argument("--force", action="store_true")
     init.set_defaults(func=init_config)
 

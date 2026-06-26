@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from spark_agent.cli import main
+from spark_agent.config import SparkAgentConfig
 
 
 def test_cli_init_writes_config(tmp_path, capsys) -> None:
@@ -23,6 +24,28 @@ def test_cli_init_writes_config(tmp_path, capsys) -> None:
     assert code == 0
     assert path.exists()
     assert "Wrote config" in capsys.readouterr().out
+    assert SparkAgentConfig.from_file(path).base_url == "http://llm.example:8000/v1"
+
+
+def test_cli_init_without_options_does_not_overwrite_existing_config(tmp_path, capsys) -> None:
+    path = tmp_path / "config.toml"
+    main(["--config", str(path), "init", "--base-url", "http://llm.example:8000/v1"])
+
+    code = main(["--config", str(path), "init"])
+
+    assert code == 0
+    assert SparkAgentConfig.from_file(path).base_url == "http://llm.example:8000/v1"
+    assert "Config already exists" in capsys.readouterr().out
+
+
+def test_cli_init_with_explicit_option_updates_existing_config(tmp_path) -> None:
+    path = tmp_path / "config.toml"
+    main(["--config", str(path), "init", "--base-url", "http://localhost:8000/v1"])
+
+    code = main(["--config", str(path), "init", "--base-url", "http://llm.example:8000/v1"])
+
+    assert code == 0
+    assert SparkAgentConfig.from_file(path).base_url == "http://llm.example:8000/v1"
 
 
 def test_cli_prompt_preview_uses_config(tmp_path, capsys) -> None:

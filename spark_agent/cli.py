@@ -11,7 +11,10 @@ import httpx
 from spark_agent.config import SparkAgentConfig, default_config_path, write_default_config
 from spark_agent.core.executor import AgentExecutor, VLLMClientConfig, VLLMRequestError
 from spark_agent.core.prompt_engine import PromptBlock, PromptEngine
+from spark_agent.core.types import ToolSpec
+from spark_agent.session import SessionStore
 from spark_agent.tools.codebase import codebase_tool_specs, tool_definitions, view_file_outline
+from spark_agent.tools.workspace import workspace_tool_definitions, workspace_tool_specs
 
 
 def build_prompt(config: SparkAgentConfig, *, repo_root: Path | None = None) -> PromptEngine:
@@ -30,10 +33,12 @@ def build_prompt(config: SparkAgentConfig, *, repo_root: Path | None = None) -> 
                 name="system",
                 content=(
                     "You are SparkAgent, a cache-stable coding agent optimized for local "
-                    "OpenAI-compatible inference servers. Use tools for repository inspection. "
+                    "OpenAI-compatible inference servers. Use tools for repository inspection, "
+                    "targeted edits, and validation. "
                     "Never load large files into context when a grep or outline is sufficient. "
-                    "For broad repository questions, use at most two tool rounds, then answer "
-                    "with concise next steps.\n"
+                    "When changing code, inspect first, patch narrowly, then run the most relevant "
+                    "allowlisted validation command. Keep working until the task is complete or a "
+                    "real blocker is reached.\n"
                     f"{language_policy}"
                 ),
             ),
@@ -42,12 +47,21 @@ def build_prompt(config: SparkAgentConfig, *, repo_root: Path | None = None) -> 
                 content=(
                     f"Repository root: {root.name or '.'}\n"
                     f"Context budget target: {config.repo_context_budget} bytes.\n"
-                    "Retrieve code context append-only through repo_grep and view_file_outline."
+                    "Retrieve code context append-only through repo_grep, view_file_outline, "
+                    "list_files, and read_file. Use apply_patch for edits."
                 ),
             ),
-            PromptBlock.from_jsonable("tool_definitions", tool_definitions()),
+            PromptBlock.from_jsonable("tool_definitions", all_tool_definitions()),
         ],
     )
+
+
+def all_tool_definitions() -> list[dict[str, object]]:
+    return [*tool_definitions(), *workspace_tool_definitions()]
+
+
+def all_tool_specs(repo_root: Path | None = None) -> list[ToolSpec]:
+    return [*codebase_tool_specs(repo_root), *workspace_tool_specs(repo_root)]
 
 
 def build_final_prompt(config: SparkAgentConfig, source_prompt: PromptEngine) -> PromptEngine:
@@ -167,7 +181,8 @@ async def run_local_retrieval_agent(
                     "in this final answer call. Use the provided compact repository snapshot. "
                     "Do not emit tool calls or DSML. Answer concisely with practical next steps. "
                     "The executable is spark-agent, not spark_agent. Known CLI commands are: "
-                    "spark-agent init, spark-agent doctor, spark-agent run, spark-agent prompt-preview."
+                    "spark-agent init, spark-agent doctor, spark-agent run, spark-agent chat, "
+                    "spark-agent continue, spark-agent prompt-preview."
                 ),
             )
         ]
@@ -242,7 +257,7 @@ async def run_agent(args: argparse.Namespace) -> int:
         async with AgentExecutor(
             prompt_engine=prompt,
             config=client_config,
-            tools=codebase_tool_specs() if args.retrieval_mode == "model" else (),
+            tools=all_tool_specs(Path.cwd()) if args.retrieval_mode == "model" else (),
         ) as agent:
             prompt.append_user_message(task)
             tool_rounds = 0
@@ -314,6 +329,127 @@ async def run_agent(args: argparse.Namespace) -> int:
         print("\nInterrupted.", file=sys.stderr)
         return 130
     print(answer)
+    return 0
+
+
+async def run_session_agent(args: argparse.Namespace) -> int:
+    config = SparkAgentConfig.from_file(Path(args.config) if args.config else None)
+    store = SessionStore(Path.cwd())
+    try:
+        if args.session:
+            session = store.load(args.session)
+            resumed = True
+        elif args.resume:
+            session = store.load_latest()
+            resumed = True
+        else:
+            session = store.create(title=args.task)
+            resumed = False
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Session error: {exc}", file=sys.stderr)
+        return 2
+
+    prompt = build_prompt(config)
+    for event in session.events:
+        prompt.append_event(event)
+
+    task = args.task or sys.stdin.read().strip()
+    if not task and not resumed:
+        print("No task provided. Pass a prompt or pipe one through stdin.", file=sys.stderr)
+        return 2
+    if task:
+        prompt.append_user_message(task)
+        session = store.append_events(session, [prompt.dynamic_events[-1]])
+    elif resumed:
+        prompt.append_user_message("Continue the previous task from the current repository state.")
+        session = store.append_events(session, [prompt.dynamic_events[-1]])
+
+    if not args.quiet:
+        action = "resuming" if resumed else "created"
+        print(f"[spark-agent] {action} session {session.session_id}", file=sys.stderr, flush=True)
+
+    timeout_s = args.timeout if args.timeout is not None else min(config.timeout_s, 60.0)
+    max_tokens = args.max_tokens if args.max_tokens is not None else min(config.max_tokens, 1024)
+    client_config = VLLMClientConfig(
+        base_url=config.base_url,
+        model=config.model,
+        api_key=config.api_key,
+        timeout_s=timeout_s,
+        max_tokens=max_tokens,
+        max_tool_result_chars=args.max_tool_result_chars,
+    )
+    saved_events = len(prompt.dynamic_events)
+    tool_rounds = 0
+    answer: str | None = None
+    force_finalize = False
+
+    try:
+        async with AgentExecutor(
+            prompt_engine=prompt,
+            config=client_config,
+            tools=all_tool_specs(Path.cwd()),
+        ) as agent:
+            for turn_number in range(1, args.max_steps + 1):
+                if not args.quiet:
+                    print(
+                        f"[spark-agent] step {turn_number}/{args.max_steps}: waiting for "
+                        f"{config.model} (timeout={timeout_s:g}s, max_tokens={max_tokens})...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                turn = await agent.step()
+                new_events = list(prompt.dynamic_events[saved_events:])
+                if new_events:
+                    session = store.append_events(session, new_events)
+                    saved_events += len(new_events)
+                if turn.tool_calls:
+                    tool_rounds += 1
+                    if not args.quiet:
+                        names = [
+                            str(tool_call.get("function", {}).get("name", "unknown"))
+                            for tool_call in turn.tool_calls
+                        ]
+                        print(
+                            f"[spark-agent] ran tools: {', '.join(names)}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    if tool_rounds >= args.max_tool_rounds:
+                        prompt.append_user_message(
+                            "Tool budget reached. Produce a concise final answer with current "
+                            "status, files changed, validation run, and remaining blockers."
+                        )
+                        session = store.append_events(session, [prompt.dynamic_events[-1]])
+                        saved_events += 1
+                        force_finalize = True
+                        break
+                    continue
+                answer = turn.content or ""
+                break
+        if answer is None and force_finalize:
+            async with AgentExecutor(
+                prompt_engine=prompt,
+                config=client_config,
+                tools=(),
+            ) as final_agent:
+                turn = await final_agent.step()
+                new_events = list(prompt.dynamic_events[saved_events:])
+                if new_events:
+                    session = store.append_events(session, new_events)
+                answer = turn.content or ""
+    except VLLMRequestError as exc:
+        print(f"Provider request failed: {exc}", file=sys.stderr)
+        return 1
+    except RuntimeError as exc:
+        print(f"Agent stopped: {exc}", file=sys.stderr)
+        return 1
+
+    if answer is None:
+        print(f"Agent stopped after {args.max_steps} steps. Session: {session.session_id}", file=sys.stderr)
+        return 1
+    print(answer)
+    if not args.quiet:
+        print(f"[spark-agent] session: {session.session_id}", file=sys.stderr, flush=True)
     return 0
 
 
@@ -490,6 +626,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum characters of local repository snapshot sent to the model.",
     )
     run_parser.set_defaults(async_func=run_agent)
+
+    chat_parser = subparsers.add_parser("chat", help="Start a persistent local coding session.")
+    chat_parser.add_argument("task", nargs="?", help="Initial task prompt. Reads stdin if omitted.")
+    chat_parser.add_argument("--session", help="Resume a specific session id instead of creating one.")
+    chat_parser.add_argument("--resume", action="store_true", help="Resume the latest session.")
+    chat_parser.add_argument("--max-steps", type=int, default=16)
+    chat_parser.add_argument("--max-tool-rounds", type=int, default=12)
+    chat_parser.add_argument("--timeout", type=float, default=None)
+    chat_parser.add_argument("--max-tokens", type=int, default=None)
+    chat_parser.add_argument("--max-tool-result-chars", type=int, default=6000)
+    chat_parser.add_argument("--quiet", action="store_true")
+    chat_parser.set_defaults(async_func=run_session_agent)
+
+    continue_parser = subparsers.add_parser("continue", help="Continue the latest persistent session.")
+    continue_parser.add_argument("task", nargs="?", help="Optional follow-up prompt.")
+    continue_parser.add_argument("--session", help="Session id to resume.")
+    continue_parser.add_argument("--max-steps", type=int, default=16)
+    continue_parser.add_argument("--max-tool-rounds", type=int, default=12)
+    continue_parser.add_argument("--timeout", type=float, default=None)
+    continue_parser.add_argument("--max-tokens", type=int, default=None)
+    continue_parser.add_argument("--max-tool-result-chars", type=int, default=6000)
+    continue_parser.add_argument("--quiet", action="store_true")
+    continue_parser.set_defaults(async_func=run_session_agent, resume=True)
 
     preview = subparsers.add_parser("prompt-preview", help="Print the static prompt prefix.")
     preview.set_defaults(func=prompt_preview)

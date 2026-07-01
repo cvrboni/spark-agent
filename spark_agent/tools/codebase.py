@@ -79,31 +79,38 @@ def tool_definitions() -> list[JsonObject]:
     ]
 
 
-def codebase_tool_specs() -> list[ToolSpec]:
+def codebase_tool_specs(repo_root: Path | None = None) -> list[ToolSpec]:
+    base_root = (repo_root or Path.cwd()).resolve()
     definitions = {item["function"]["name"]: item for item in tool_definitions()}
     return [
-        ToolSpec(name="repo_grep", definition=definitions["repo_grep"], handler=_repo_grep_handler),
+        ToolSpec(
+            name="repo_grep",
+            definition=definitions["repo_grep"],
+            handler=lambda arguments: _repo_grep_handler(arguments, base_root),
+        ),
         ToolSpec(
             name="view_file_outline",
             definition=definitions["view_file_outline"],
-            handler=_view_file_outline_handler,
+            handler=lambda arguments: _view_file_outline_handler(arguments, base_root),
         ),
     ]
 
 
-async def _repo_grep_handler(arguments: JsonObject) -> JsonObject:
+async def _repo_grep_handler(arguments: JsonObject, repo_root: Path) -> JsonObject:
+    root = _resolve_under_root(repo_root, str(arguments.get("root", ".")))
     return await repo_grep(
         query=str(arguments["query"]),
-        root=str(arguments.get("root", ".")),
+        root=root,
         glob=str(arguments.get("glob", "*")),
         context_lines=int(arguments.get("context_lines", DEFAULT_CONTEXT_LINES)),
         max_matches=int(arguments.get("max_matches", DEFAULT_MAX_MATCHES)),
     )
 
 
-async def _view_file_outline_handler(arguments: JsonObject) -> JsonObject:
+async def _view_file_outline_handler(arguments: JsonObject, repo_root: Path) -> JsonObject:
+    path = _resolve_under_root(repo_root, str(arguments["path"]))
     return await view_file_outline(
-        path=str(arguments["path"]),
+        path=path,
         max_bytes=int(arguments.get("max_bytes", DEFAULT_MAX_BYTES)),
     )
 
@@ -371,6 +378,15 @@ def _safe_file(path: str | Path) -> Path:
     if not file_path.exists() or not file_path.is_file():
         raise FileNotFoundError(f"file not found: {file_path}")
     return file_path
+
+
+def _resolve_under_root(root: Path, value: str) -> Path:
+    path = (root / value).expanduser().resolve() if not Path(value).is_absolute() else Path(value).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise PermissionError(f"path escapes repository root: {value}") from exc
+    return path
 
 
 def _read_prefix(path: Path, max_bytes: int) -> bytes:

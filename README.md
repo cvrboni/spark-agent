@@ -63,6 +63,15 @@ spark-agent run "Analizza questa repo e dimmi da dove iniziare"
 
 SparkAgent stores configuration in `~/.config/spark-agent/config.toml`.
 
+For persistent coding work, use sessions:
+
+```bash
+spark-agent chat "Implementa la prossima milestone e valida le modifiche"
+spark-agent continue
+```
+
+Sessions are stored append-only under `.spark-agent/sessions` in the active repository.
+
 ## Python API
 
 ```python
@@ -128,6 +137,11 @@ entire files into the model context.
 
 Returns a compact outline of classes, functions, and methods. Python files use `ast`; other
 languages use a conservative text outline.
+
+`list_files`, `read_file`, `apply_patch`, `run_command`
+
+Persistent sessions can inspect repository files, apply unified diffs, and run allowlisted
+validation commands such as `git status`, `git diff`, `pytest`, `ruff check`, and `compileall`.
 
 ## Development
 

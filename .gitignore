@@ -42,6 +42,7 @@ coverage.xml
 .env.*
 !.env.example
 *.local
+.spark-agent/
 
 # IDEs
 .idea/
@@ -57,4 +58,3 @@ Thumbs.db
 *.log
 benchmark-results/
 ttft-results/
-

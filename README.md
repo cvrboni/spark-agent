@@ -66,11 +66,14 @@ SparkAgent stores configuration in `~/.config/spark-agent/config.toml`.
 For persistent coding work, use sessions:
 
 ```bash
+spark-agent chat
 spark-agent chat "Implementa la prossima milestone e valida le modifiche"
 spark-agent continue
 ```
 
-Sessions are stored append-only under `.spark-agent/sessions` in the active repository.
+Running `spark-agent chat` without a prompt opens a terminal chat that stays in the same session
+until `/exit`. Sessions are stored append-only under `.spark-agent/sessions` in the active
+repository.
 
 ## Python API
 

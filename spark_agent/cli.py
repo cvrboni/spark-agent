@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -12,7 +13,7 @@ from spark_agent.config import SparkAgentConfig, default_config_path, write_defa
 from spark_agent.core.executor import AgentExecutor, VLLMClientConfig, VLLMRequestError
 from spark_agent.core.prompt_engine import PromptBlock, PromptEngine
 from spark_agent.core.types import ToolSpec
-from spark_agent.session import SessionStore
+from spark_agent.session import AgentSession, SessionStore
 from spark_agent.tools.codebase import codebase_tool_specs, tool_definitions, view_file_outline
 from spark_agent.tools.workspace import workspace_tool_definitions, workspace_tool_specs
 
@@ -62,6 +63,13 @@ def all_tool_definitions() -> list[dict[str, object]]:
 
 def all_tool_specs(repo_root: Path | None = None) -> list[ToolSpec]:
     return [*codebase_tool_specs(repo_root), *workspace_tool_specs(repo_root)]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionTurnResult:
+    code: int
+    session: AgentSession
+    answer: str | None
 
 
 def build_final_prompt(config: SparkAgentConfig, source_prompt: PromptEngine) -> PromptEngine:
@@ -334,6 +342,9 @@ async def run_agent(args: argparse.Namespace) -> int:
 
 async def run_session_agent(args: argparse.Namespace) -> int:
     config = SparkAgentConfig.from_file(Path(args.config) if args.config else None)
+    if getattr(args, "interactive", False) and not sys.stdin.isatty():
+        print("Interactive chat requires a TTY. Pass a task argument or pipe a prompt instead.", file=sys.stderr)
+        return 2
     store = SessionStore(Path.cwd())
     try:
         if args.session:
@@ -349,22 +360,53 @@ async def run_session_agent(args: argparse.Namespace) -> int:
         print(f"Session error: {exc}", file=sys.stderr)
         return 2
 
+    if _should_open_interactive_chat(args):
+        return await run_interactive_chat(args, config=config, store=store, session=session, resumed=resumed)
+
     prompt = build_prompt(config)
     for event in session.events:
         prompt.append_event(event)
 
-    task = args.task or sys.stdin.read().strip()
+    task = args.task or _read_piped_stdin()
     if not task and not resumed:
         print("No task provided. Pass a prompt or pipe one through stdin.", file=sys.stderr)
         return 2
     if task:
-        prompt.append_user_message(task)
-        session = store.append_events(session, [prompt.dynamic_events[-1]])
+        pass
     elif resumed:
-        prompt.append_user_message("Continue the previous task from the current repository state.")
-        session = store.append_events(session, [prompt.dynamic_events[-1]])
+        task = "Continue the previous task from the current repository state."
+    result = await run_session_turn(
+        args,
+        config=config,
+        store=store,
+        session=session,
+        prompt=prompt,
+        task=task,
+        announce=not args.quiet,
+        resumed=resumed,
+    )
+    if result.answer is not None:
+        print(result.answer)
+        if not args.quiet:
+            print(f"[spark-agent] session: {result.session.session_id}", file=sys.stderr, flush=True)
+    return result.code
 
-    if not args.quiet:
+
+async def run_session_turn(
+    args: argparse.Namespace,
+    *,
+    config: SparkAgentConfig,
+    store: SessionStore,
+    session: AgentSession,
+    prompt: PromptEngine,
+    task: str,
+    announce: bool,
+    resumed: bool,
+) -> SessionTurnResult:
+    prompt.append_user_message(task)
+    session = store.append_events(session, [prompt.dynamic_events[-1]])
+
+    if announce:
         action = "resuming" if resumed else "created"
         print(f"[spark-agent] {action} session {session.session_id}", file=sys.stderr, flush=True)
 
@@ -390,7 +432,7 @@ async def run_session_agent(args: argparse.Namespace) -> int:
             tools=all_tool_specs(Path.cwd()),
         ) as agent:
             for turn_number in range(1, args.max_steps + 1):
-                if not args.quiet:
+                if announce:
                     print(
                         f"[spark-agent] step {turn_number}/{args.max_steps}: waiting for "
                         f"{config.model} (timeout={timeout_s:g}s, max_tokens={max_tokens})...",
@@ -404,7 +446,7 @@ async def run_session_agent(args: argparse.Namespace) -> int:
                     saved_events += len(new_events)
                 if turn.tool_calls:
                     tool_rounds += 1
-                    if not args.quiet:
+                    if announce:
                         names = [
                             str(tool_call.get("function", {}).get("name", "unknown"))
                             for tool_call in turn.tool_calls
@@ -439,18 +481,108 @@ async def run_session_agent(args: argparse.Namespace) -> int:
                 answer = turn.content or ""
     except VLLMRequestError as exc:
         print(f"Provider request failed: {exc}", file=sys.stderr)
-        return 1
+        return SessionTurnResult(code=1, session=session, answer=None)
     except RuntimeError as exc:
         print(f"Agent stopped: {exc}", file=sys.stderr)
-        return 1
+        return SessionTurnResult(code=1, session=session, answer=None)
 
     if answer is None:
         print(f"Agent stopped after {args.max_steps} steps. Session: {session.session_id}", file=sys.stderr)
-        return 1
-    print(answer)
-    if not args.quiet:
-        print(f"[spark-agent] session: {session.session_id}", file=sys.stderr, flush=True)
-    return 0
+        return SessionTurnResult(code=1, session=session, answer=None)
+    return SessionTurnResult(code=0, session=session, answer=answer)
+
+
+async def run_interactive_chat(
+    args: argparse.Namespace,
+    *,
+    config: SparkAgentConfig,
+    store: SessionStore,
+    session: AgentSession,
+    resumed: bool,
+) -> int:
+    if not sys.stdin.isatty():
+        print("Interactive chat requires a TTY. Pass a task argument or pipe a prompt instead.", file=sys.stderr)
+        return 2
+
+    prompt = build_prompt(config)
+    for event in session.events:
+        prompt.append_event(event)
+
+    action = "resumed" if resumed else "created"
+    print(f"SparkAgent {action} session {session.session_id}")
+    print("Type /help for commands, /exit to leave.")
+
+    current_session = session
+    current_resumed = resumed
+    if args.task:
+        result = await run_session_turn(
+            args,
+            config=config,
+            store=store,
+            session=current_session,
+            prompt=prompt,
+            task=args.task,
+            announce=not args.quiet,
+            resumed=current_resumed,
+        )
+        current_session = result.session
+        current_resumed = True
+        if result.answer:
+            print()
+            print(result.answer)
+            print()
+        if result.code != 0:
+            return result.code
+
+    while True:
+        try:
+            raw = await asyncio.to_thread(input, "spark> ")
+        except EOFError:
+            print()
+            return 0
+        task = raw.strip()
+        if not task:
+            continue
+        if task in {"/exit", "/quit"}:
+            return 0
+        if task == "/session":
+            print(current_session.session_id)
+            continue
+        if task == "/help":
+            print("/session  show current session id")
+            print("/exit     leave the chat")
+            print("/quit     leave the chat")
+            continue
+        result = await run_session_turn(
+            args,
+            config=config,
+            store=store,
+            session=current_session,
+            prompt=prompt,
+            task=task,
+            announce=not args.quiet,
+            resumed=current_resumed,
+        )
+        current_session = result.session
+        current_resumed = True
+        if result.answer:
+            print()
+            print(result.answer)
+            print()
+        if result.code != 0:
+            return result.code
+
+
+def _should_open_interactive_chat(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "interactive", False)) or (
+        args.command in {"chat", "continue"} and not args.task and sys.stdin.isatty()
+    )
+
+
+def _read_piped_stdin() -> str:
+    if sys.stdin.isatty():
+        return ""
+    return sys.stdin.read().strip()
 
 
 async def doctor(args: argparse.Namespace) -> int:
@@ -627,10 +759,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.set_defaults(async_func=run_agent)
 
-    chat_parser = subparsers.add_parser("chat", help="Start a persistent local coding session.")
-    chat_parser.add_argument("task", nargs="?", help="Initial task prompt. Reads stdin if omitted.")
+    chat_parser = subparsers.add_parser("chat", help="Open a persistent terminal chat session.")
+    chat_parser.add_argument("task", nargs="?", help="Initial task prompt. Opens a REPL if omitted.")
     chat_parser.add_argument("--session", help="Resume a specific session id instead of creating one.")
     chat_parser.add_argument("--resume", action="store_true", help="Resume the latest session.")
+    chat_parser.add_argument("--interactive", action="store_true", help="Open the terminal chat UI.")
     chat_parser.add_argument("--max-steps", type=int, default=16)
     chat_parser.add_argument("--max-tool-rounds", type=int, default=12)
     chat_parser.add_argument("--timeout", type=float, default=None)
@@ -640,8 +773,9 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser.set_defaults(async_func=run_session_agent)
 
     continue_parser = subparsers.add_parser("continue", help="Continue the latest persistent session.")
-    continue_parser.add_argument("task", nargs="?", help="Optional follow-up prompt.")
+    continue_parser.add_argument("task", nargs="?", help="Optional follow-up prompt. Opens a REPL if omitted.")
     continue_parser.add_argument("--session", help="Session id to resume.")
+    continue_parser.add_argument("--interactive", action="store_true", help="Open the terminal chat UI.")
     continue_parser.add_argument("--max-steps", type=int, default=16)
     continue_parser.add_argument("--max-tool-rounds", type=int, default=12)
     continue_parser.add_argument("--timeout", type=float, default=None)

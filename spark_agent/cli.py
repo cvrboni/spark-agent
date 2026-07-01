@@ -4,12 +4,14 @@ import argparse
 import asyncio
 import json
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 
 from spark_agent.config import SparkAgentConfig, default_config_path, write_default_config
+from spark_agent.core.approval import ApprovalPolicy
 from spark_agent.core.executor import AgentExecutor, VLLMClientConfig, VLLMRequestError
 from spark_agent.core.prompt_engine import PromptBlock, PromptEngine
 from spark_agent.core.types import ToolSpec
@@ -65,11 +67,72 @@ def all_tool_specs(repo_root: Path | None = None) -> list[ToolSpec]:
     return [*codebase_tool_specs(repo_root), *workspace_tool_specs(repo_root)]
 
 
+def resolve_retrieval_mode(config: SparkAgentConfig, requested: str) -> str:
+    if requested != "auto":
+        return requested
+    return "model" if config.prefer_local_tools else "local"
+
+
+def resolve_approval_policy(config: SparkAgentConfig, requested: str | None) -> ApprovalPolicy:
+    value = requested or config.approval_policy
+    return ApprovalPolicy.from_value(value)
+
+
+def resolve_stream_enabled(config: SparkAgentConfig, args: argparse.Namespace) -> bool:
+    if getattr(args, "stream", None) is not None:
+        return bool(args.stream)
+    return config.stream_responses
+
+
+def build_vllm_client_config(
+    config: SparkAgentConfig,
+    args: argparse.Namespace,
+    *,
+    timeout_s: float,
+    max_tokens: int,
+    max_tool_result_chars: int | None = None,
+) -> VLLMClientConfig:
+    approval = (
+        ApprovalPolicy.AUTO
+        if getattr(args, "yes", False)
+        else resolve_approval_policy(config, getattr(args, "approval", None))
+    )
+    return VLLMClientConfig(
+        base_url=config.base_url,
+        model=config.model,
+        api_key=config.api_key,
+        timeout_s=timeout_s,
+        max_tokens=max_tokens,
+        max_tool_result_chars=max_tool_result_chars or args.max_tool_result_chars,
+        stream=resolve_stream_enabled(config, args),
+        repo_context_budget=config.repo_context_budget,
+        approval_policy=approval,
+        approval_interactive=sys.stdin.isatty() and not getattr(args, "yes", False),
+    )
+
+
+def _stream_token_printer() -> Callable[[str], None]:
+    def on_token(token: str) -> None:
+        sys.stdout.write(token)
+        sys.stdout.flush()
+
+    return on_token
+
+
+def _print_stream_metrics(turn: object, *, announce: bool) -> None:
+    if not announce:
+        return
+    ttft_ms = getattr(turn, "ttft_ms", None)
+    if ttft_ms is not None:
+        print(f"\n[spark-agent] ttft={ttft_ms:.0f}ms", file=sys.stderr, flush=True)
+
+
 @dataclass(frozen=True, slots=True)
 class SessionTurnResult:
     code: int
     session: AgentSession
     answer: str | None
+    streamed: bool = False
 
 
 def build_final_prompt(config: SparkAgentConfig, source_prompt: PromptEngine) -> PromptEngine:
@@ -230,7 +293,8 @@ async def run_agent(args: argparse.Namespace) -> int:
         return 2
     timeout_s = args.timeout if args.timeout is not None else min(config.timeout_s, 30.0)
     max_tokens = args.max_tokens if args.max_tokens is not None else min(config.max_tokens, 768)
-    if args.retrieval_mode == "local":
+    retrieval_mode = resolve_retrieval_mode(config, args.retrieval_mode)
+    if retrieval_mode == "local":
         return await run_local_retrieval_agent(
             args,
             config=config,
@@ -244,28 +308,26 @@ async def run_agent(args: argparse.Namespace) -> int:
         if args.tool_call_max_tokens is not None
         else min(max_tokens, 256)
     )
-    client_config = VLLMClientConfig(
-        base_url=config.base_url,
-        model=config.model,
-        api_key=config.api_key,
+    client_config = build_vllm_client_config(
+        config,
+        args,
         timeout_s=timeout_s,
         max_tokens=tool_call_max_tokens,
-        max_tool_result_chars=args.max_tool_result_chars,
     )
-    final_client_config = VLLMClientConfig(
-        base_url=config.base_url,
-        model=config.model,
-        api_key=config.api_key,
+    final_client_config = build_vllm_client_config(
+        config,
+        args,
         timeout_s=timeout_s,
         max_tokens=max_tokens,
-        max_tool_result_chars=args.max_tool_result_chars,
     )
+    stream_tokens = client_config.stream and sys.stdout.isatty() and not args.quiet
     try:
         answer: str | None = None
+        streamed_answer = False
         async with AgentExecutor(
             prompt_engine=prompt,
             config=client_config,
-            tools=all_tool_specs(Path.cwd()) if args.retrieval_mode == "model" else (),
+            tools=all_tool_specs(Path.cwd()) if retrieval_mode == "model" else (),
         ) as agent:
             prompt.append_user_message(task)
             tool_rounds = 0
@@ -278,7 +340,13 @@ async def run_agent(args: argparse.Namespace) -> int:
                         file=sys.stderr,
                         flush=True,
                     )
-                turn = await agent.step()
+                turn = await agent.step(
+                    on_content_token=_stream_token_printer() if stream_tokens else None,
+                )
+                if stream_tokens and turn.content and not turn.tool_calls:
+                    print()
+                    streamed_answer = True
+                _print_stream_metrics(turn, announce=not args.quiet)
                 if turn.tool_calls:
                     tool_rounds += 1
                     names = [
@@ -323,7 +391,13 @@ async def run_agent(args: argparse.Namespace) -> int:
                 config=final_client_config,
                 tools=(),
             ) as final_agent:
-                final_turn = await final_agent.step()
+                final_turn = await final_agent.step(
+                    on_content_token=_stream_token_printer() if stream_tokens else None,
+                )
+                if stream_tokens and final_turn.content:
+                    print()
+                    streamed_answer = True
+                _print_stream_metrics(final_turn, announce=not args.quiet)
                 answer = final_turn.content or ""
     except VLLMRequestError as exc:
         print(f"Provider request failed: {exc}", file=sys.stderr)
@@ -336,7 +410,8 @@ async def run_agent(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         return 130
-    print(answer)
+    if not (streamed_answer and answer):
+        print(answer)
     return 0
 
 
@@ -412,18 +487,18 @@ async def run_session_turn(
 
     timeout_s = args.timeout if args.timeout is not None else min(config.timeout_s, 60.0)
     max_tokens = args.max_tokens if args.max_tokens is not None else min(config.max_tokens, 1024)
-    client_config = VLLMClientConfig(
-        base_url=config.base_url,
-        model=config.model,
-        api_key=config.api_key,
+    client_config = build_vllm_client_config(
+        config,
+        args,
         timeout_s=timeout_s,
         max_tokens=max_tokens,
-        max_tool_result_chars=args.max_tool_result_chars,
     )
+    stream_tokens = client_config.stream and sys.stdout.isatty() and announce
     saved_events = len(prompt.dynamic_events)
     tool_rounds = 0
     answer: str | None = None
     force_finalize = False
+    streamed_answer = False
 
     try:
         async with AgentExecutor(
@@ -439,7 +514,13 @@ async def run_session_turn(
                         file=sys.stderr,
                         flush=True,
                     )
-                turn = await agent.step()
+                turn = await agent.step(
+                    on_content_token=_stream_token_printer() if stream_tokens else None,
+                )
+                if stream_tokens and turn.content and not turn.tool_calls:
+                    print()
+                    streamed_answer = True
+                _print_stream_metrics(turn, announce=announce)
                 new_events = list(prompt.dynamic_events[saved_events:])
                 if new_events:
                     session = store.append_events(session, new_events)
@@ -474,7 +555,13 @@ async def run_session_turn(
                 config=client_config,
                 tools=(),
             ) as final_agent:
-                turn = await final_agent.step()
+                turn = await final_agent.step(
+                    on_content_token=_stream_token_printer() if stream_tokens else None,
+                )
+                if stream_tokens and turn.content:
+                    print()
+                    streamed_answer = True
+                _print_stream_metrics(turn, announce=announce)
                 new_events = list(prompt.dynamic_events[saved_events:])
                 if new_events:
                     session = store.append_events(session, new_events)
@@ -489,7 +576,7 @@ async def run_session_turn(
     if answer is None:
         print(f"Agent stopped after {args.max_steps} steps. Session: {session.session_id}", file=sys.stderr)
         return SessionTurnResult(code=1, session=session, answer=None)
-    return SessionTurnResult(code=0, session=session, answer=answer)
+    return SessionTurnResult(code=0, session=session, answer=answer, streamed=streamed_answer)
 
 
 async def run_interactive_chat(
@@ -527,9 +614,11 @@ async def run_interactive_chat(
         )
         current_session = result.session
         current_resumed = True
-        if result.answer:
+        if result.answer and not result.streamed:
             print()
             print(result.answer)
+            print()
+        elif result.streamed:
             print()
         if result.code != 0:
             return result.code
@@ -565,9 +654,11 @@ async def run_interactive_chat(
         )
         current_session = result.session
         current_resumed = True
-        if result.answer:
+        if result.answer and not result.streamed:
             print()
             print(result.answer)
+            print()
+        elif result.streamed:
             print()
         if result.code != 0:
             return result.code
@@ -655,6 +746,8 @@ def init_config(args: argparse.Namespace) -> int:
         max_tokens=existing.max_tokens,
         repo_context_budget=existing.repo_context_budget,
         prefer_local_tools=existing.prefer_local_tools,
+        approval_policy=existing.approval_policy,
+        stream_responses=existing.stream_responses,
     )
     has_explicit_updates = args.base_url is not None or args.model is not None or args.language is not None
     should_write = args.force or has_explicit_updates or not config_path.exists()
@@ -681,6 +774,33 @@ def prompt_preview(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_agent_runtime_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--approval",
+        choices=["auto", "interactive", "never"],
+        default=None,
+        help="Approval policy for apply_patch and run_command. Defaults to config.",
+    )
+    parser.add_argument(
+        "--stream",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Stream model tokens to stdout when on a TTY. Defaults to config stream_responses.",
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Auto-approve risky tools (equivalent to --approval auto for this run).",
+    )
+    parser.add_argument(
+        "--max-tool-result-chars",
+        type=int,
+        default=6000,
+        help="Maximum characters from each tool result appended back into the model context.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="spark-agent",
@@ -703,16 +823,19 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("task", nargs="?", help="Task prompt. Reads stdin if omitted.")
     run_parser.add_argument(
         "--retrieval-mode",
-        choices=["local", "model", "none"],
-        default="local",
-        help="Context retrieval strategy. local is fastest and is the default.",
+        choices=["auto", "local", "model", "none"],
+        default="auto",
+        help=(
+            "Context retrieval strategy. auto follows prefer_local_tools from config "
+            "(model when true, local when false)."
+        ),
     )
     run_parser.add_argument("--max-turns", type=int, default=8)
     run_parser.add_argument(
         "--max-tool-rounds",
         type=int,
-        default=1,
-        help="Maximum tool-calling rounds before forcing a final answer. Defaults to 1.",
+        default=4,
+        help="Maximum tool-calling rounds before forcing a final answer.",
     )
     run_parser.add_argument(
         "--timeout",
@@ -733,18 +856,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max output tokens while tools are enabled. Defaults to min(max_tokens, 256).",
     )
     run_parser.add_argument(
-        "--max-tool-result-chars",
-        type=int,
-        default=6000,
-        help="Maximum characters from each tool result appended back into the model context.",
-    )
-    run_parser.add_argument(
         "--finalize",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="After max tool turns, make one final no-tool call to force an answer.",
     )
     run_parser.add_argument("--quiet", action="store_true", help="Hide progress messages.")
+    _add_agent_runtime_flags(run_parser)
     run_parser.add_argument(
         "--local-snapshot-files",
         type=int,
@@ -768,8 +886,8 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument("--max-tool-rounds", type=int, default=12)
     chat_parser.add_argument("--timeout", type=float, default=None)
     chat_parser.add_argument("--max-tokens", type=int, default=None)
-    chat_parser.add_argument("--max-tool-result-chars", type=int, default=6000)
     chat_parser.add_argument("--quiet", action="store_true")
+    _add_agent_runtime_flags(chat_parser)
     chat_parser.set_defaults(async_func=run_session_agent)
 
     continue_parser = subparsers.add_parser("continue", help="Continue the latest persistent session.")
@@ -780,8 +898,8 @@ def build_parser() -> argparse.ArgumentParser:
     continue_parser.add_argument("--max-tool-rounds", type=int, default=12)
     continue_parser.add_argument("--timeout", type=float, default=None)
     continue_parser.add_argument("--max-tokens", type=int, default=None)
-    continue_parser.add_argument("--max-tool-result-chars", type=int, default=6000)
     continue_parser.add_argument("--quiet", action="store_true")
+    _add_agent_runtime_flags(continue_parser)
     continue_parser.set_defaults(async_func=run_session_agent, resume=True)
 
     preview = subparsers.add_parser("prompt-preview", help="Print the static prompt prefix.")

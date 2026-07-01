@@ -43,3 +43,14 @@ def test_dynamic_role_validation() -> None:
     with pytest.raises(ValueError, match="Unsupported chat role"):
         engine.append_event({"role": "developer", "content": "not supported"})
 
+
+def test_dynamic_tail_bytes_and_remaining_budget() -> None:
+    engine = PromptEngine(static_blocks=[PromptBlock("system", "stable")])
+    assert engine.dynamic_tail_bytes() == 0
+    assert engine.remaining_context_budget(1000) == 1000
+
+    engine.append_user_message("x" * 200)
+    used = engine.dynamic_tail_bytes()
+    assert used > 0
+    assert engine.remaining_context_budget(used + 50) == 50
+

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from spark_agent.cli import main
+from spark_agent.cli import main, resolve_retrieval_mode
 from spark_agent.config import SparkAgentConfig
 
 
@@ -58,6 +58,15 @@ def test_cli_prompt_preview_uses_config(tmp_path, capsys) -> None:
     output = capsys.readouterr().out
     assert "<spark_static_prefix_v1>" in output
     assert "Rispondi in italiano" in output
+
+
+def test_resolve_retrieval_mode_auto_follows_prefer_local_tools() -> None:
+    with_tools = SparkAgentConfig(prefer_local_tools=True)
+    without_tools = SparkAgentConfig(prefer_local_tools=False)
+
+    assert resolve_retrieval_mode(with_tools, "auto") == "model"
+    assert resolve_retrieval_mode(without_tools, "auto") == "local"
+    assert resolve_retrieval_mode(with_tools, "none") == "none"
 
 
 def test_cli_doctor_rejects_secret_in_api_key_env(tmp_path, capsys) -> None:

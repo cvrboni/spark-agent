@@ -3,14 +3,18 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 
+from spark_agent.core.approval import ApprovalPolicy, request_approval
 from spark_agent.core.prompt_engine import JsonValue, PromptEngine
+from spark_agent.core.streaming import collect_streamed_completion
 from spark_agent.core.types import JsonObject, ToolSpec
+
+type TokenCallback = Callable[[str], None]
 
 
 class VLLMRequestError(RuntimeError):
@@ -27,6 +31,10 @@ class VLLMClientConfig:
     temperature: float = 0.0
     max_tokens: int = 2048
     max_tool_result_chars: int = 6_000
+    stream: bool = False
+    repo_context_budget: int | None = None
+    approval_policy: ApprovalPolicy = ApprovalPolicy.INTERACTIVE
+    approval_interactive: bool = True
 
     @property
     def chat_completions_url(self) -> str:
@@ -49,6 +57,7 @@ class AgentTurn:
     reasoning_content: str | None
     tool_calls: tuple[JsonObject, ...] = ()
     raw_message: JsonObject = field(default_factory=dict)
+    ttft_ms: float | None = None
 
 
 class AgentExecutor:
@@ -94,10 +103,25 @@ class AgentExecutor:
             raise RuntimeError(f"Agent did not finish within {max_turns} turns")
         return final_answer
 
-    async def step(self) -> AgentTurn:
-        completion = await self._chat_completion()
+    async def step(
+        self,
+        *,
+        on_content_token: TokenCallback | None = None,
+        on_reasoning_token: TokenCallback | None = None,
+    ) -> AgentTurn:
+        completion, ttft_ms = await self._chat_completion(
+            on_content_token=on_content_token,
+            on_reasoning_token=on_reasoning_token,
+        )
         message = self._extract_message(completion)
         turn = self._message_to_turn(message)
+        turn = AgentTurn(
+            content=turn.content,
+            reasoning_content=turn.reasoning_content,
+            tool_calls=turn.tool_calls,
+            raw_message=turn.raw_message,
+            ttft_ms=ttft_ms,
+        )
         self.prompt_engine.append_assistant_message(
             content=turn.content,
             reasoning_content=turn.reasoning_content,
@@ -107,7 +131,12 @@ class AgentExecutor:
             await self._execute_tool_calls(turn.tool_calls)
         return turn
 
-    async def _chat_completion(self) -> JsonObject:
+    async def _chat_completion(
+        self,
+        *,
+        on_content_token: TokenCallback | None = None,
+        on_reasoning_token: TokenCallback | None = None,
+    ) -> tuple[JsonObject, float | None]:
         payload: JsonObject = {
             "model": self.config.model,
             "messages": self.prompt_engine.render_messages(),
@@ -118,6 +147,15 @@ class AgentExecutor:
             payload["tools"] = [spec.definition for spec in self._tool_specs.values()]
             payload["tool_choice"] = "auto"
 
+        if self.config.stream:
+            return await self._chat_completion_stream(
+                payload,
+                on_content_token=on_content_token,
+                on_reasoning_token=on_reasoning_token,
+            )
+        return await self._chat_completion_json(payload), None
+
+    async def _chat_completion_json(self, payload: JsonObject) -> JsonObject:
         try:
             response = await self._client.post(
                 self.config.chat_completions_url,
@@ -140,6 +178,64 @@ class AgentExecutor:
             ) from exc
         except json.JSONDecodeError as exc:
             raise VLLMRequestError("vLLM returned invalid JSON") from exc
+
+    async def _chat_completion_stream(
+        self,
+        payload: JsonObject,
+        *,
+        on_content_token: TokenCallback | None = None,
+        on_reasoning_token: TokenCallback | None = None,
+    ) -> tuple[JsonObject, float | None]:
+        import time
+
+        payload = dict(payload)
+        payload["stream"] = True
+        started = time.perf_counter()
+        ttft_ms: float | None = None
+
+        def record_ttft() -> None:
+            nonlocal ttft_ms
+            if ttft_ms is None:
+                ttft_ms = (time.perf_counter() - started) * 1000
+
+        def content_token(token: str) -> None:
+            record_ttft()
+            if on_content_token is not None:
+                on_content_token(token)
+
+        def reasoning_token(token: str) -> None:
+            record_ttft()
+            if on_reasoning_token is not None:
+                on_reasoning_token(token)
+
+        try:
+            async with self._client.stream(
+                "POST",
+                self.config.chat_completions_url,
+                json=payload,
+                headers=self.config.headers,
+            ) as response:
+                response.raise_for_status()
+                completion = await collect_streamed_completion(
+                    response,
+                    on_content_token=content_token,
+                    on_reasoning_token=reasoning_token,
+                )
+        except httpx.TimeoutException as exc:
+            raise VLLMRequestError(
+                f"vLLM request timed out after {self.config.timeout_s:g}s ({type(exc).__name__})"
+            ) from exc
+        except httpx.NetworkError as exc:
+            detail = str(exc) or type(exc).__name__
+            raise VLLMRequestError(f"vLLM network error: {detail}") from exc
+        except httpx.HTTPStatusError as exc:
+            body = exc.response.text[:1000]
+            raise VLLMRequestError(
+                f"vLLM returned HTTP {exc.response.status_code}: {body}"
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise VLLMRequestError("vLLM returned invalid JSON in stream") from exc
+        return completion, ttft_ms
 
     @staticmethod
     def _extract_message(completion: Mapping[str, Any]) -> JsonObject:
@@ -181,6 +277,24 @@ class AgentExecutor:
 
             try:
                 arguments = self._decode_arguments(function.get("arguments", {}))
+            except Exception as exc:
+                results[index] = (tool_call_id, name, {"error": f"{type(exc).__name__}: {exc}"})
+                return
+
+            if not request_approval(
+                name,
+                arguments,
+                policy=self.config.approval_policy,
+                interactive=self.config.approval_interactive,
+            ):
+                results[index] = (
+                    tool_call_id,
+                    name,
+                    {"error": "user rejected tool execution", "skipped": True},
+                )
+                return
+
+            try:
                 result = await spec.handler(arguments)
             except Exception as exc:
                 result = {"error": f"{type(exc).__name__}: {exc}"}
@@ -215,6 +329,14 @@ class AgentExecutor:
 
     def _truncate_tool_result(self, result: JsonValue | str) -> JsonValue | str:
         max_chars = max(500, self.config.max_tool_result_chars)
+        if self.config.repo_context_budget is not None:
+            remaining = self.prompt_engine.remaining_context_budget(self.config.repo_context_budget)
+            if remaining <= 0:
+                return {
+                    "truncated": True,
+                    "error": "context budget exhausted; tool result omitted",
+                }
+            max_chars = min(max_chars, max(500, remaining - 200))
         if isinstance(result, str):
             if len(result) <= max_chars:
                 return result

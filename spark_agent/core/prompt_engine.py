@@ -141,6 +141,15 @@ class PromptEngine:
         dynamic = "\n".join(_canonical_json(dict(event)) for event in self._dynamic_events)
         return f"{self._static_prefix}\n{DYNAMIC_HEADER}\n{dynamic}"
 
+    def dynamic_tail_bytes(self) -> int:
+        if not self._dynamic_events:
+            return 0
+        dynamic = "\n".join(_canonical_json(dict(event)) for event in self._dynamic_events)
+        return len(f"{DYNAMIC_HEADER}\n{dynamic}".encode())
+
+    def remaining_context_budget(self, total_budget: int) -> int:
+        return max(0, total_budget - self.dynamic_tail_bytes())
+
     @staticmethod
     def _render_static_prefix(blocks: Sequence[PromptBlock]) -> str:
         rendered_blocks = "\n".join(block.render() for block in blocks)

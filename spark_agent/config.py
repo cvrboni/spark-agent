@@ -25,6 +25,8 @@ class SparkAgentConfig:
     max_tokens: int = 2048
     repo_context_budget: int = 24_000
     prefer_local_tools: bool = True
+    approval_policy: str = "interactive"
+    stream_responses: bool = True
 
     @classmethod
     def from_file(cls, path: Path | None = None) -> Self:
@@ -44,6 +46,8 @@ class SparkAgentConfig:
             language=str(agent.get("language", DEFAULT_LANGUAGE)),
             repo_context_budget=int(agent.get("repo_context_budget", 24_000)),
             prefer_local_tools=bool(agent.get("prefer_local_tools", True)),
+            approval_policy=str(agent.get("approval_policy", "interactive")),
+            stream_responses=bool(agent.get("stream_responses", True)),
         )
         return cls.from_env(config)
 
@@ -63,6 +67,11 @@ class SparkAgentConfig:
                 os.getenv("SPARK_AGENT_PREFER_LOCAL_TOOLS"),
                 default=config.prefer_local_tools,
             ),
+            approval_policy=os.getenv("SPARK_AGENT_APPROVAL_POLICY", config.approval_policy),
+            stream_responses=_env_bool(
+                os.getenv("SPARK_AGENT_STREAM_RESPONSES"),
+                default=config.stream_responses,
+            ),
         )
 
     @property
@@ -81,6 +90,7 @@ class SparkAgentConfig:
 
     def to_toml(self) -> str:
         prefer_local_tools = "true" if self.prefer_local_tools else "false"
+        stream_responses = "true" if self.stream_responses else "false"
         return (
             "# SparkAgent local configuration\n"
             "# Optimized for OpenAI-compatible local inference servers such as vLLM.\n\n"
@@ -94,6 +104,8 @@ class SparkAgentConfig:
             f"language = {_toml_string(self.language)} # auto, it, en\n"
             f"repo_context_budget = {self.repo_context_budget}\n"
             f"prefer_local_tools = {prefer_local_tools}\n"
+            f"approval_policy = {_toml_string(self.approval_policy)} # auto, interactive, never\n"
+            f"stream_responses = {stream_responses}\n"
         )
 
     def to_file(self, path: Path) -> None:

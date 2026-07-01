@@ -126,6 +126,24 @@ def test_executor_truncates_large_tool_results() -> None:
     assert len(result["preview"]) <= 500
 
 
+def test_executor_respects_context_budget_for_tool_results() -> None:
+    prompt = PromptEngine(static_blocks=[PromptBlock("system", "stable")])
+    prompt.append_user_message("x" * 5000)
+    executor = AgentExecutor(
+        prompt_engine=prompt,
+        config=VLLMClientConfig(
+            max_tool_result_chars=6000,
+            repo_context_budget=5200,
+        ),
+        client=FakeClient({"choices": [{"message": {"content": "ok"}}]}),  # type: ignore[arg-type]
+    )
+
+    result = executor._truncate_tool_result({"payload": "y" * 4000})
+
+    assert isinstance(result, dict)
+    assert result.get("truncated") is True or result.get("error")
+
+
 @pytest.mark.asyncio
 async def test_executor_sends_bearer_auth_header() -> None:
     prompt = PromptEngine(static_blocks=[PromptBlock("system", "stable")])

@@ -336,7 +336,17 @@ async def doctor(args: argparse.Namespace) -> int:
     print(f"Provider: {client_config.chat_completions_url}")
     print(f"Model: {config.model}")
     print(f"Language: {config.language}")
-    print(f"API key env: {config.api_key_env} ({'set' if config.api_key else 'not set'})")
+    print(
+        f"API key env: {_redact_if_secret_like(config.api_key_env)} "
+        f"({'set' if config.api_key else 'not set'})"
+    )
+    if not config.api_key_env_is_valid_name or config.api_key_env_looks_like_secret:
+        print(
+            "Config error: provider.api_key_env must be an environment variable name, "
+            "for example SPARK_AGENT_API_KEY. Put the token in that environment variable, "
+            "not directly in config.toml."
+        )
+        return 2
     try:
         async with httpx.AsyncClient(timeout=client_config.timeout_s) as client:
             response = await client.post(
@@ -352,6 +362,17 @@ async def doctor(args: argparse.Namespace) -> int:
     content = data.get("choices", [{}])[0].get("message", {}).get("content")
     print(f"Provider check: ok ({content!r})")
     return 0
+
+
+def _redact_if_secret_like(value: str) -> str:
+    if len(value) > 12 and (
+        value.startswith(("sk-", "sk_", "Bearer "))
+        or all(char.lower() in "0123456789abcdef" for char in value)
+    ):
+        return f"{value[:4]}...{value[-4:]}"
+    if len(value) <= 12 or value.isidentifier():
+        return value
+    return f"{value[:4]}...{value[-4:]}"
 
 
 def init_config(args: argparse.Namespace) -> int:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,8 @@ APP_DIR_NAME = "spark-agent"
 DEFAULT_BASE_URL = "http://localhost:8000/v1"
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_LANGUAGE = "auto"
+ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+HEX_SECRET_RE = re.compile(r"^[a-f0-9]{24,}$", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +68,16 @@ class SparkAgentConfig:
     @property
     def api_key(self) -> str | None:
         return os.getenv(self.api_key_env) or os.getenv("OPENAI_API_KEY")
+
+    @property
+    def api_key_env_is_valid_name(self) -> bool:
+        return bool(ENV_VAR_NAME_RE.fullmatch(self.api_key_env))
+
+    @property
+    def api_key_env_looks_like_secret(self) -> bool:
+        return bool(HEX_SECRET_RE.fullmatch(self.api_key_env)) or self.api_key_env.startswith(
+            ("sk-", "sk_", "Bearer ")
+        )
 
     def to_toml(self) -> str:
         prefer_local_tools = "true" if self.prefer_local_tools else "false"

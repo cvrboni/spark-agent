@@ -58,3 +58,17 @@ def test_cli_prompt_preview_uses_config(tmp_path, capsys) -> None:
     output = capsys.readouterr().out
     assert "<spark_static_prefix_v1>" in output
     assert "Rispondi in italiano" in output
+
+
+def test_cli_doctor_rejects_secret_in_api_key_env(tmp_path, capsys) -> None:
+    path = tmp_path / "config.toml"
+    secret = "e57aa47a3e76800de34f946cd20794a0"
+    SparkAgentConfig(api_key_env=secret).to_file(path)
+
+    code = main(["--config", str(path), "doctor"])
+
+    output = capsys.readouterr().out
+    assert code == 2
+    assert secret not in output
+    assert "e57a...94a0" in output
+    assert "must be an environment variable name" in output

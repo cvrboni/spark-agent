@@ -3,11 +3,26 @@ from __future__ import annotations
 import asyncio
 import shlex
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 
 
 class SandboxViolationError(PermissionError):
     """Raised when a tool request violates the local sandbox policy."""
+
+
+class SandboxBackend(StrEnum):
+    LOCAL = "local"
+    DOCKER = "docker"
+    PODMAN = "podman"
+
+    @classmethod
+    def from_value(cls, value: str) -> SandboxBackend:
+        try:
+            return cls(value)
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in cls)
+            raise ValueError(f"sandbox_backend must be one of: {allowed}") from exc
 
 
 IGNORED_PATH_PARTS = frozenset({".git", ".spark-agent", ".venv", "__pycache__", "node_modules"})
@@ -135,6 +150,90 @@ class LocalSandbox:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ContainerSandbox:
+    """Docker/Podman-backed sandbox for stronger local isolation.
+
+    The active repository is mounted read-write at `/workspace`, the container runs with network
+    disabled, a non-root UID/GID, dropped capabilities, and conservative process/memory limits.
+    The image must provide the validation commands the agent is allowed to run.
+    """
+
+    root: Path
+    engine: SandboxBackend
+    image: str = "python:3.13-slim"
+    command_policy: CommandSandboxPolicy = field(default_factory=CommandSandboxPolicy.default)
+    memory: str = "2g"
+    cpus: str = "2"
+    pids_limit: int = 256
+
+    def __post_init__(self) -> None:
+        if self.engine not in {SandboxBackend.DOCKER, SandboxBackend.PODMAN}:
+            raise ValueError("ContainerSandbox requires docker or podman backend")
+
+    async def run_command(self, command: list[str], *, timeout_s: float) -> SandboxProcessResult:
+        self.command_policy.validate(command)
+        container_command = self.build_container_command(command)
+        return await _run_process(
+            container_command,
+            cwd=self.root,
+            timeout_s=timeout_s,
+            timeout_label=f"{self.engine.value} run",
+        )
+
+    async def apply_patch(self, patch: str, *, timeout_s: float = 30.0) -> SandboxProcessResult:
+        validate_patch(patch)
+        command = ["git", "apply", "--whitespace=nowarn", "--"]
+        container_command = self.build_container_command(command)
+        return await _run_process(
+            container_command,
+            cwd=self.root,
+            timeout_s=timeout_s,
+            stdin=patch.encode("utf-8"),
+            timeout_label=f"{self.engine.value} git apply",
+        )
+
+    def build_container_command(self, command: list[str]) -> list[str]:
+        root = str(self.root.resolve())
+        return [
+            self.engine.value,
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            str(self.pids_limit),
+            "--memory",
+            self.memory,
+            "--cpus",
+            self.cpus,
+            "--user",
+            "1000:1000",
+            "--workdir",
+            "/workspace",
+            "--volume",
+            f"{root}:/workspace:rw",
+            self.image,
+            *command,
+        ]
+
+
+def build_sandbox(
+    root: Path,
+    *,
+    backend: SandboxBackend | str = SandboxBackend.LOCAL,
+    image: str = "python:3.13-slim",
+) -> LocalSandbox | ContainerSandbox:
+    resolved = SandboxBackend.from_value(str(backend))
+    if resolved is SandboxBackend.LOCAL:
+        return LocalSandbox(root)
+    return ContainerSandbox(root=root, engine=resolved, image=image)
+
+
 def validate_read_path(path: Path, root: Path) -> None:
     relative = path.resolve().relative_to(root.resolve())
     parts = set(relative.parts)
@@ -192,3 +291,33 @@ def _validate_relative_repo_path(value: str) -> None:
         raise SandboxViolationError(f"patch path escapes repository root: {value}")
     if any(part in IGNORED_PATH_PARTS for part in path.parts):
         raise SandboxViolationError(f"patch path targets ignored or internal directory: {value}")
+
+
+async def _run_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout_s: float,
+    stdin: bytes | None = None,
+    timeout_label: str,
+) -> SandboxProcessResult:
+    timeout_s = max(1.0, min(float(timeout_s), 120.0))
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdin=asyncio.subprocess.PIPE if stdin is not None else None,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(stdin), timeout=timeout_s)
+    except TimeoutError as exc:
+        process.kill()
+        await process.wait()
+        raise TimeoutError(f"{timeout_label} timed out after {timeout_s:g}s") from exc
+    return SandboxProcessResult(
+        command=tuple(command),
+        returncode=process.returncode,
+        stdout=stdout.decode("utf-8", errors="replace"),
+        stderr=stderr.decode("utf-8", errors="replace"),
+    )

@@ -54,6 +54,14 @@ source .venv/bin/activate
 python -m pip install -e ".[dev]"
 ```
 
+For richer terminal rendering with colors, panels, and syntax-highlighted approval previews:
+
+```bash
+python -m pip install -e ".[ui]"
+```
+
+Without the `ui` extra, SparkAgent falls back to plain terminal output.
+
 ## Quick Start
 
 For local vLLM or another OpenAI-compatible server:
@@ -76,10 +84,13 @@ timeout_s = 120
 max_tokens = 2048
 max_retries = 1
 retry_backoff_s = 0.25
+sandbox_backend = "local" # local, docker, podman
+sandbox_image = "python:3.13-slim"
 ```
 
 Environment overrides include `SPARK_AGENT_BASE_URL`, `SPARK_AGENT_MODEL`,
-`SPARK_AGENT_MAX_RETRIES`, and `SPARK_AGENT_RETRY_BACKOFF_S`.
+`SPARK_AGENT_MAX_RETRIES`, `SPARK_AGENT_RETRY_BACKOFF_S`, `SPARK_AGENT_SANDBOX_BACKEND`, and
+`SPARK_AGENT_SANDBOX_IMAGE`.
 
 For persistent coding work, use sessions:
 
@@ -92,6 +103,14 @@ spark-agent continue
 Running `spark-agent chat` without a prompt opens a terminal chat that stays in the same session
 until `/exit`. Sessions are stored append-only under `.spark-agent/sessions` in the active
 repository.
+
+Interactive chat commands:
+
+- `/help` shows available commands
+- `/session` prints the current session id
+- `/config` prints the active model, provider, sandbox, and language
+- `/tools` lists built-in tool names
+- `/exit` or `/quit` leaves the chat
 
 ## Python API
 
@@ -198,8 +217,12 @@ SparkAgent has a local sandbox policy layer, not a full OS isolation boundary.
 - `apply_patch` validates unified diff paths before invoking `git apply`.
 - `run_command` uses exec-style subprocess calls without a shell and only permits allowlisted
   validation commands.
-- `apply_patch` and `run_command` are routed through `LocalSandbox`, so stronger backends such as
-  Docker, bubblewrap, or firejail can be added without changing tool schemas.
+- `apply_patch` and `run_command` are routed through a sandbox backend, so stronger isolation can
+  be enabled without changing tool schemas.
+- Set `sandbox_backend = "docker"` or `sandbox_backend = "podman"` to run patch and command tools
+  inside a container with the repository mounted at `/workspace`, network disabled, dropped
+  capabilities, `no-new-privileges`, and process/memory limits. The configured image must contain
+  the validation commands you allow the agent to run.
 
 Do not run SparkAgent against untrusted repositories with `--yes` unless the repository is already
 isolated by your own container or VM.

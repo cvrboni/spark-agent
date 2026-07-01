@@ -83,5 +83,6 @@ def test_cli_doctor_rejects_secret_in_api_key_env(tmp_path, capsys) -> None:
     assert secret not in output
     assert "e57a...94a0" in output
     assert "Provider retries" in output
+    assert "Sandbox: local" in output
     assert "Repo index cache" in output
     assert "must be an environment variable name" in output

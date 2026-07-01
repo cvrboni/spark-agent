@@ -14,9 +14,16 @@ The built-in workspace tools enforce a local policy layer:
   command prefixes;
 - `apply_patch` validates patch paths before invoking `git apply`.
 
-This is not a complete OS sandbox. `LocalSandbox` is a policy and subprocess boundary, not a
-container, VM, seccomp profile, or namespace isolation layer. For untrusted repositories or
-auto-approval mode, run SparkAgent inside your own container or VM.
+The default `local` backend is not a complete OS sandbox. It is a policy and subprocess boundary,
+not a container, VM, seccomp profile, or namespace isolation layer.
+
+For stronger isolation, configure `sandbox_backend = "docker"` or `"podman"`. The container backend
+runs patch and command tools with the repository mounted at `/workspace`, network disabled, dropped
+capabilities, `no-new-privileges`, and process/memory limits. The configured image must include the
+validation commands the agent is allowed to run.
+
+For highly untrusted repositories or auto-approval mode, still prefer running SparkAgent itself
+inside your own container or VM.
 
 When integrating custom tools, apply the same rule: model output is hostile until validated.
 

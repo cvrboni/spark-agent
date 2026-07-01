@@ -19,6 +19,8 @@ def test_write_and_read_config(tmp_path) -> None:
     assert config.language == "it"
     assert config.max_retries == 1
     assert config.retry_backoff_s == 0.25
+    assert config.sandbox_backend == "local"
+    assert config.sandbox_image == "python:3.13-slim"
 
 
 def test_env_overrides_config(tmp_path, monkeypatch) -> None:
@@ -29,6 +31,8 @@ def test_env_overrides_config(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("SPARK_AGENT_MODEL", "override-model")
     monkeypatch.setenv("SPARK_AGENT_MAX_RETRIES", "3")
     monkeypatch.setenv("SPARK_AGENT_RETRY_BACKOFF_S", "0.5")
+    monkeypatch.setenv("SPARK_AGENT_SANDBOX_BACKEND", "docker")
+    monkeypatch.setenv("SPARK_AGENT_SANDBOX_IMAGE", "spark-agent-test:latest")
 
     config = SparkAgentConfig.from_file(path)
 
@@ -36,3 +40,5 @@ def test_env_overrides_config(tmp_path, monkeypatch) -> None:
     assert config.model == "override-model"
     assert config.max_retries == 3
     assert config.retry_backoff_s == 0.5
+    assert config.sandbox_backend == "docker"
+    assert config.sandbox_image == "spark-agent-test:latest"

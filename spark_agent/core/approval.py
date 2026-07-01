@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any
 
+from spark_agent.ui import TerminalUI
+
 type JsonObject = dict[str, Any]
 
 RISKY_TOOLS = frozenset({"apply_patch", "run_command"})
@@ -56,14 +58,12 @@ def request_approval(
     if policy is ApprovalPolicy.NEVER:
         return False
     if not interactive or not sys.stdin.isatty():
-        print(
-            f"[spark-agent] approval required for {name} but stdin is not interactive; skipping.",
-            file=sys.stderr,
-            flush=True,
+        TerminalUI.stderr().warning(
+            f"approval required for {name} but stdin is not interactive; skipping."
         )
         return False
     summary = summarize_tool_action(name, arguments)
-    print(f"\n[spark-agent] approval required:\n{summary}\n", file=sys.stderr, flush=True)
+    TerminalUI.stderr().approval_request(name, summary)
     try:
         answer = input("Approve? [y/N]: ").strip().lower()
     except EOFError:

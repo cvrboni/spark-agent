@@ -32,6 +32,9 @@ dev = [
   "pytest-asyncio>=0.23.0",
   "ruff>=0.6.0",
 ]
+ui = [
+  "rich>=13.0.0",
+]
 
 [project.scripts]
 spark-agent = "spark_agent.cli:main"

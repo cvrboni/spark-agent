@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from spark_agent.core.sandbox import LocalSandbox, validate_read_path
+from spark_agent.core.sandbox import build_sandbox, validate_read_path
 from spark_agent.core.types import ToolSpec
 
 type JsonObject = dict[str, Any]
@@ -98,8 +98,14 @@ def workspace_tool_definitions() -> list[JsonObject]:
     ]
 
 
-def workspace_tool_specs(repo_root: Path | None = None) -> list[ToolSpec]:
+def workspace_tool_specs(
+    repo_root: Path | None = None,
+    *,
+    sandbox_backend: str = "local",
+    sandbox_image: str = "python:3.13-slim",
+) -> list[ToolSpec]:
     root = (repo_root or Path.cwd()).resolve()
+    sandbox = build_sandbox(root, backend=sandbox_backend, image=sandbox_image)
     definitions = {item["function"]["name"]: item for item in workspace_tool_definitions()}
     return [
         ToolSpec(
@@ -115,12 +121,12 @@ def workspace_tool_specs(repo_root: Path | None = None) -> list[ToolSpec]:
         ToolSpec(
             name="apply_patch",
             definition=definitions["apply_patch"],
-            handler=lambda arguments: _apply_patch_handler(arguments, root),
+            handler=lambda arguments: _apply_patch_handler(arguments, sandbox),
         ),
         ToolSpec(
             name="run_command",
             definition=definitions["run_command"],
-            handler=lambda arguments: _run_command_handler(arguments, root),
+            handler=lambda arguments: _run_command_handler(arguments, sandbox),
         ),
     ]
 
@@ -160,21 +166,21 @@ async def _read_file_handler(arguments: JsonObject, root: Path) -> JsonObject:
     }
 
 
-async def _apply_patch_handler(arguments: JsonObject, root: Path) -> JsonObject:
+async def _apply_patch_handler(arguments: JsonObject, sandbox) -> JsonObject:
     patch = str(arguments["patch"])
-    result = await LocalSandbox(root).apply_patch(patch)
+    result = await sandbox.apply_patch(patch)
     payload = result.to_json(stdout_chars=4000, stderr_chars=4000)
     payload["ok"] = result.returncode == 0
     return payload
 
 
-async def _run_command_handler(arguments: JsonObject, root: Path) -> JsonObject:
+async def _run_command_handler(arguments: JsonObject, sandbox) -> JsonObject:
     raw_command = arguments["command"]
     if not isinstance(raw_command, list) or not all(isinstance(item, str) for item in raw_command):
         raise ValueError("command must be a list of strings")
     command = [str(item) for item in raw_command]
     timeout_s = max(1.0, min(float(arguments.get("timeout_s", DEFAULT_TIMEOUT_S)), 120.0))
-    result = await LocalSandbox(root).run_command(command, timeout_s=timeout_s)
+    result = await sandbox.run_command(command, timeout_s=timeout_s)
     return result.to_json(stdout_chars=12000, stderr_chars=12000)
 
 

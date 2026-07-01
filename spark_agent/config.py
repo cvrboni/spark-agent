@@ -25,6 +25,8 @@ class SparkAgentConfig:
     max_tokens: int = 2048
     max_retries: int = 1
     retry_backoff_s: float = 0.25
+    sandbox_backend: str = "local"
+    sandbox_image: str = "python:3.13-slim"
     repo_context_budget: int = 24_000
     prefer_local_tools: bool = True
     approval_policy: str = "interactive"
@@ -47,6 +49,8 @@ class SparkAgentConfig:
             max_tokens=int(provider.get("max_tokens", 2048)),
             max_retries=int(provider.get("max_retries", 1)),
             retry_backoff_s=float(provider.get("retry_backoff_s", 0.25)),
+            sandbox_backend=str(provider.get("sandbox_backend", "local")),
+            sandbox_image=str(provider.get("sandbox_image", "python:3.13-slim")),
             language=str(agent.get("language", DEFAULT_LANGUAGE)),
             repo_context_budget=int(agent.get("repo_context_budget", 24_000)),
             prefer_local_tools=bool(agent.get("prefer_local_tools", True)),
@@ -68,6 +72,8 @@ class SparkAgentConfig:
             retry_backoff_s=float(
                 os.getenv("SPARK_AGENT_RETRY_BACKOFF_S", str(config.retry_backoff_s))
             ),
+            sandbox_backend=os.getenv("SPARK_AGENT_SANDBOX_BACKEND", config.sandbox_backend),
+            sandbox_image=os.getenv("SPARK_AGENT_SANDBOX_IMAGE", config.sandbox_image),
             repo_context_budget=int(
                 os.getenv("SPARK_AGENT_REPO_CONTEXT_BUDGET", str(config.repo_context_budget))
             ),
@@ -109,7 +115,9 @@ class SparkAgentConfig:
             f"timeout_s = {self.timeout_s:g}\n"
             f"max_tokens = {self.max_tokens}\n"
             f"max_retries = {self.max_retries}\n"
-            f"retry_backoff_s = {self.retry_backoff_s:g}\n\n"
+            f"retry_backoff_s = {self.retry_backoff_s:g}\n"
+            f"sandbox_backend = {_toml_string(self.sandbox_backend)} # local, docker, podman\n"
+            f"sandbox_image = {_toml_string(self.sandbox_image)}\n\n"
             "[agent]\n"
             f"language = {_toml_string(self.language)} # auto, it, en\n"
             f"repo_context_budget = {self.repo_context_budget}\n"
@@ -135,13 +143,21 @@ def write_default_config(
     base_url: str = DEFAULT_BASE_URL,
     model: str = DEFAULT_MODEL,
     language: str = DEFAULT_LANGUAGE,
+    sandbox_backend: str = "local",
+    sandbox_image: str = "python:3.13-slim",
     force: bool = False,
 ) -> Path:
     config_path = path or default_config_path()
     if config_path.exists() and not force:
         return config_path
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    SparkAgentConfig(base_url=base_url, model=model, language=language).to_file(config_path)
+    SparkAgentConfig(
+        base_url=base_url,
+        model=model,
+        language=language,
+        sandbox_backend=sandbox_backend,
+        sandbox_image=sandbox_image,
+    ).to_file(config_path)
     return config_path
 
 

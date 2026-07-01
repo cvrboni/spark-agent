@@ -19,6 +19,7 @@ from spark_agent.core.types import ToolSpec
 from spark_agent.session import AgentSession, SessionStore
 from spark_agent.tools.codebase import codebase_tool_specs, tool_definitions
 from spark_agent.tools.workspace import workspace_tool_definitions, workspace_tool_specs
+from spark_agent.ui import TerminalUI
 
 
 def build_prompt(config: SparkAgentConfig, *, repo_root: Path | None = None) -> PromptEngine:
@@ -72,8 +73,15 @@ def all_tool_definitions() -> list[dict[str, object]]:
     return [*tool_definitions(), *workspace_tool_definitions()]
 
 
-def all_tool_specs(repo_root: Path | None = None) -> list[ToolSpec]:
-    return [*codebase_tool_specs(repo_root), *workspace_tool_specs(repo_root)]
+def all_tool_specs(config: SparkAgentConfig, repo_root: Path | None = None) -> list[ToolSpec]:
+    return [
+        *codebase_tool_specs(repo_root),
+        *workspace_tool_specs(
+            repo_root,
+            sandbox_backend=config.sandbox_backend,
+            sandbox_image=config.sandbox_image,
+        ),
+    ]
 
 
 def resolve_retrieval_mode(config: SparkAgentConfig, requested: str) -> str:
@@ -135,7 +143,7 @@ def _print_stream_metrics(turn: object, *, announce: bool) -> None:
         return
     ttft_ms = getattr(turn, "ttft_ms", None)
     if ttft_ms is not None:
-        print(f"\n[spark-agent] ttft={ttft_ms:.0f}ms", file=sys.stderr, flush=True)
+        TerminalUI.stderr().metric("ttft", f"{ttft_ms:.0f}ms")
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,8 +199,9 @@ async def run_local_retrieval_agent(
     timeout_s: float,
     max_tokens: int,
 ) -> int:
+    ui = TerminalUI.stderr(enabled=not args.quiet)
     if not args.quiet:
-        print("[spark-agent] collecting local repository snapshot...", file=sys.stderr, flush=True)
+        ui.info("collecting local repository snapshot")
     snapshot = ContextPacker.from_root(Path.cwd()).pack(
         task,
         max_files=args.local_snapshot_files,
@@ -225,11 +234,8 @@ async def run_local_retrieval_agent(
         retry_backoff_s=config.retry_backoff_s,
     )
     if not args.quiet:
-        print(
-            f"[spark-agent] waiting for {config.model} "
-            f"(timeout={timeout_s:g}s, max_tokens={max_tokens})...",
-            file=sys.stderr,
-            flush=True,
+        ui.info(
+            f"waiting for {config.model} (timeout={timeout_s:g}s, max_tokens={max_tokens})"
         )
     try:
         async with AgentExecutor(prompt_engine=prompt, config=client_config, tools=()) as agent:
@@ -243,6 +249,7 @@ async def run_local_retrieval_agent(
 
 async def run_agent(args: argparse.Namespace) -> int:
     config = SparkAgentConfig.from_file(Path(args.config) if args.config else None)
+    ui = TerminalUI.stderr(enabled=not args.quiet)
     prompt = build_prompt(config)
     task = args.task or sys.stdin.read().strip()
     if not task:
@@ -284,18 +291,18 @@ async def run_agent(args: argparse.Namespace) -> int:
         async with AgentExecutor(
             prompt_engine=prompt,
             config=client_config,
-            tools=all_tool_specs(Path.cwd()) if retrieval_mode == "model" else (),
+            tools=all_tool_specs(config, Path.cwd()) if retrieval_mode == "model" else (),
         ) as agent:
             prompt.append_user_message(task)
             tool_rounds = 0
             for turn_number in range(1, args.max_turns + 1):
                 if not args.quiet:
-                    print(
-                        f"[spark-agent] turn {turn_number}/{args.max_turns}: "
-                        f"waiting for {config.model} "
-                        f"(timeout={timeout_s:g}s, max_tokens={tool_call_max_tokens})...",
-                        file=sys.stderr,
-                        flush=True,
+                    ui.turn(
+                        turn_number,
+                        args.max_turns,
+                        model=config.model,
+                        timeout_s=timeout_s,
+                        max_tokens=tool_call_max_tokens,
                     )
                 turn = await agent.step(
                     on_content_token=_stream_token_printer() if stream_tokens else None,
@@ -311,18 +318,10 @@ async def run_agent(args: argparse.Namespace) -> int:
                         for tool_call in turn.tool_calls
                     ]
                     if not args.quiet:
-                        print(
-                            f"[spark-agent] ran tools: {', '.join(names)}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
+                        ui.tools_ran(names)
                     if tool_rounds >= args.max_tool_rounds:
                         if not args.quiet:
-                            print(
-                                "[spark-agent] tool round budget reached; finalizing.",
-                                file=sys.stderr,
-                                flush=True,
-                            )
+                            ui.warning("tool round budget reached; finalizing")
                         break
                     continue
                 answer = turn.content or ""
@@ -337,11 +336,7 @@ async def run_agent(args: argparse.Namespace) -> int:
                 )
         if answer is None:
             if not args.quiet:
-                print(
-                    "[spark-agent] finalizing without tools...",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                ui.info("finalizing without tools")
             final_prompt = build_final_prompt(config, prompt)
             async with AgentExecutor(
                 prompt_engine=final_prompt,
@@ -435,12 +430,13 @@ async def run_session_turn(
     announce: bool,
     resumed: bool,
 ) -> SessionTurnResult:
+    ui = TerminalUI.stderr(enabled=announce)
     prompt.append_user_message(task)
     session = store.append_events(session, [prompt.dynamic_events[-1]])
 
     if announce:
         action = "resuming" if resumed else "created"
-        print(f"[spark-agent] {action} session {session.session_id}", file=sys.stderr, flush=True)
+        ui.info(f"{action} session {session.session_id}")
 
     timeout_s = args.timeout if args.timeout is not None else min(config.timeout_s, 60.0)
     max_tokens = args.max_tokens if args.max_tokens is not None else min(config.max_tokens, 1024)
@@ -461,15 +457,16 @@ async def run_session_turn(
         async with AgentExecutor(
             prompt_engine=prompt,
             config=client_config,
-            tools=all_tool_specs(Path.cwd()),
+            tools=all_tool_specs(config, Path.cwd()),
         ) as agent:
             for turn_number in range(1, args.max_steps + 1):
                 if announce:
-                    print(
-                        f"[spark-agent] step {turn_number}/{args.max_steps}: waiting for "
-                        f"{config.model} (timeout={timeout_s:g}s, max_tokens={max_tokens})...",
-                        file=sys.stderr,
-                        flush=True,
+                    ui.step(
+                        turn_number,
+                        args.max_steps,
+                        model=config.model,
+                        timeout_s=timeout_s,
+                        max_tokens=max_tokens,
                     )
                 turn = await agent.step(
                     on_content_token=_stream_token_printer() if stream_tokens else None,
@@ -489,11 +486,7 @@ async def run_session_turn(
                             str(tool_call.get("function", {}).get("name", "unknown"))
                             for tool_call in turn.tool_calls
                         ]
-                        print(
-                            f"[spark-agent] ran tools: {', '.join(names)}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
+                        ui.tools_ran(names)
                     if tool_rounds >= args.max_tool_rounds:
                         prompt.append_user_message(
                             "Tool budget reached. Produce a concise final answer with current "
@@ -553,8 +546,13 @@ async def run_interactive_chat(
         prompt.append_event(event)
 
     action = "resumed" if resumed else "created"
-    print(f"SparkAgent {action} session {session.session_id}")
-    print("Type /help for commands, /exit to leave.")
+    TerminalUI.stderr().session_header(
+        session_id=session.session_id,
+        action=action,
+        model=config.model,
+        sandbox_backend=config.sandbox_backend,
+        repo=Path.cwd().name or ".",
+    )
 
     current_session = session
     current_resumed = resumed
@@ -596,8 +594,19 @@ async def run_interactive_chat(
             continue
         if task == "/help":
             print("/session  show current session id")
+            print("/config   show active model, provider, and sandbox")
+            print("/tools    show built-in tool names")
             print("/exit     leave the chat")
             print("/quit     leave the chat")
+            continue
+        if task == "/config":
+            print(f"model: {config.model}")
+            print(f"provider: {config.base_url}")
+            print(f"sandbox: {config.sandbox_backend} ({config.sandbox_image})")
+            print(f"language: {config.language}")
+            continue
+        if task == "/tools":
+            print(", ".join(sorted(item["function"]["name"] for item in all_tool_definitions())))
             continue
         result = await run_session_turn(
             args,
@@ -654,6 +663,7 @@ async def doctor(args: argparse.Namespace) -> int:
     print(f"Provider: {client_config.chat_completions_url}")
     print(f"Model: {config.model}")
     print(f"Provider retries: {config.max_retries} (backoff={config.retry_backoff_s:g}s)")
+    print(f"Sandbox: {config.sandbox_backend} (image={config.sandbox_image})")
     print(f"Language: {config.language}")
     print(f"Repo index cache: {Path.cwd() / '.spark-agent/index/files.json'}")
     print(
@@ -707,6 +717,8 @@ def init_config(args: argparse.Namespace) -> int:
         max_tokens=existing.max_tokens,
         max_retries=existing.max_retries,
         retry_backoff_s=existing.retry_backoff_s,
+        sandbox_backend=existing.sandbox_backend,
+        sandbox_image=existing.sandbox_image,
         repo_context_budget=existing.repo_context_budget,
         prefer_local_tools=existing.prefer_local_tools,
         approval_policy=existing.approval_policy,
@@ -724,6 +736,8 @@ def init_config(args: argparse.Namespace) -> int:
         base_url=requested_config.base_url,
         model=requested_config.model,
         language=requested_config.language,
+        sandbox_backend=requested_config.sandbox_backend,
+        sandbox_image=requested_config.sandbox_image,
         force=True,
     )
     print(f"Wrote config: {path}")

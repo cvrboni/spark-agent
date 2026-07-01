@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,11 +11,13 @@ import httpx
 
 from spark_agent.config import SparkAgentConfig, default_config_path, write_default_config
 from spark_agent.core.approval import ApprovalPolicy
+from spark_agent.core.context_packer import ContextPacker
 from spark_agent.core.executor import AgentExecutor, VLLMClientConfig, VLLMRequestError
 from spark_agent.core.prompt_engine import PromptBlock, PromptEngine
+from spark_agent.core.provider import ProviderProfile
 from spark_agent.core.types import ToolSpec
 from spark_agent.session import AgentSession, SessionStore
-from spark_agent.tools.codebase import codebase_tool_specs, tool_definitions, view_file_outline
+from spark_agent.tools.codebase import codebase_tool_specs, tool_definitions
 from spark_agent.tools.workspace import workspace_tool_definitions, workspace_tool_specs
 
 
@@ -30,6 +31,7 @@ def build_prompt(config: SparkAgentConfig, *, repo_root: Path | None = None) -> 
         ),
     }.get(config.language, "Match the user's language.")
     root = repo_root or Path.cwd()
+    provider_profile = ProviderProfile.from_model(base_url=config.base_url, model=config.model)
     return PromptEngine(
         static_blocks=[
             PromptBlock(
@@ -52,6 +54,13 @@ def build_prompt(config: SparkAgentConfig, *, repo_root: Path | None = None) -> 
                     f"Context budget target: {config.repo_context_budget} bytes.\n"
                     "Retrieve code context append-only through repo_grep, view_file_outline, "
                     "list_files, and read_file. Use apply_patch for edits."
+                ),
+            ),
+            PromptBlock(
+                name="tool_call_contract",
+                content=(
+                    f"Provider profile: {provider_profile.name}\n"
+                    f"{provider_profile.tool_call_contract}"
                 ),
             ),
             PromptBlock.from_jsonable("tool_definitions", all_tool_definitions()),
@@ -103,6 +112,8 @@ def build_vllm_client_config(
         api_key=config.api_key,
         timeout_s=timeout_s,
         max_tokens=max_tokens,
+        max_retries=config.max_retries,
+        retry_backoff_s=config.retry_backoff_s,
         max_tool_result_chars=max_tool_result_chars or args.max_tool_result_chars,
         stream=resolve_stream_enabled(config, args),
         repo_context_budget=config.repo_context_budget,
@@ -169,63 +180,7 @@ def build_final_prompt(config: SparkAgentConfig, source_prompt: PromptEngine) ->
 
 
 async def build_local_repo_snapshot(root: Path, *, max_files: int = 6, max_chars: int = 8_000) -> str:
-    candidates = _collect_python_files(root)
-    candidates.sort(key=lambda path: (_repo_file_priority(path), str(path)))
-    selected = candidates[:max_files]
-    outlines = []
-    for path in selected:
-        try:
-            outline = await view_file_outline(path, max_bytes=24_000)
-        except (OSError, SyntaxError, UnicodeError) as exc:
-            outlines.append({"path": str(path.relative_to(root)), "error": str(exc)})
-            continue
-        outline["path"] = str(path.relative_to(root))
-        outlines.append(outline)
-    top_level = _top_level_entries(root)
-    rendered = json.dumps(
-        {
-            "root": ".",
-            "top_level": top_level,
-            "python_file_count": len(candidates),
-            "outlined_files": outlines,
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    if len(rendered) <= max_chars:
-        return rendered
-    return f"{rendered[:max_chars]}\n...[repository snapshot truncated to {max_chars} chars]"
-
-
-def _collect_python_files(root: Path) -> list[Path]:
-    return [
-        path
-        for path in root.rglob("*.py")
-        if path.is_file()
-        and not any(part in {".git", ".venv", "__pycache__", "node_modules"} for part in path.parts)
-    ]
-
-
-def _top_level_entries(root: Path) -> list[str]:
-    return sorted(
-        str(path.relative_to(root))
-        for path in root.iterdir()
-        if path.name not in {".git", ".venv", "__pycache__"} and not path.name.startswith(".pytest")
-    )
-
-
-def _repo_file_priority(path: Path) -> tuple[int, int]:
-    text = str(path)
-    if "spark_agent/core" in text:
-        return (0, len(path.parts))
-    if "spark_agent/cli.py" in text or "spark_agent/config.py" in text:
-        return (1, len(path.parts))
-    if "spark_agent/tools" in text:
-        return (2, len(path.parts))
-    if "tests" in path.parts:
-        return (3, len(path.parts))
-    return (4, len(path.parts))
+    return ContextPacker.from_root(root).pack("", max_files=max_files, max_chars=max_chars)
 
 
 async def run_local_retrieval_agent(
@@ -238,8 +193,8 @@ async def run_local_retrieval_agent(
 ) -> int:
     if not args.quiet:
         print("[spark-agent] collecting local repository snapshot...", file=sys.stderr, flush=True)
-    snapshot = await build_local_repo_snapshot(
-        Path.cwd(),
+    snapshot = ContextPacker.from_root(Path.cwd()).pack(
+        task,
         max_files=args.local_snapshot_files,
         max_chars=args.local_snapshot_chars,
     )
@@ -266,6 +221,8 @@ async def run_local_retrieval_agent(
         api_key=config.api_key,
         timeout_s=timeout_s,
         max_tokens=max_tokens,
+        max_retries=config.max_retries,
+        retry_backoff_s=config.retry_backoff_s,
     )
     if not args.quiet:
         print(
@@ -684,6 +641,8 @@ async def doctor(args: argparse.Namespace) -> int:
         api_key=config.api_key,
         timeout_s=min(config.timeout_s, 30.0),
         max_tokens=128,
+        max_retries=config.max_retries,
+        retry_backoff_s=config.retry_backoff_s,
     )
     payload = {
         "model": config.model,
@@ -694,7 +653,9 @@ async def doctor(args: argparse.Namespace) -> int:
     print(f"Config: {Path(args.config) if args.config else default_config_path()}")
     print(f"Provider: {client_config.chat_completions_url}")
     print(f"Model: {config.model}")
+    print(f"Provider retries: {config.max_retries} (backoff={config.retry_backoff_s:g}s)")
     print(f"Language: {config.language}")
+    print(f"Repo index cache: {Path.cwd() / '.spark-agent/index/files.json'}")
     print(
         f"API key env: {_redact_if_secret_like(config.api_key_env)} "
         f"({'set' if config.api_key else 'not set'})"
@@ -744,6 +705,8 @@ def init_config(args: argparse.Namespace) -> int:
         api_key_env=existing.api_key_env,
         timeout_s=existing.timeout_s,
         max_tokens=existing.max_tokens,
+        max_retries=existing.max_retries,
+        retry_backoff_s=existing.retry_backoff_s,
         repo_context_budget=existing.repo_context_budget,
         prefer_local_tools=existing.prefer_local_tools,
         approval_policy=existing.approval_policy,

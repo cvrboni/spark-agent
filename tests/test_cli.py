@@ -58,6 +58,8 @@ def test_cli_prompt_preview_uses_config(tmp_path, capsys) -> None:
     output = capsys.readouterr().out
     assert "<spark_static_prefix_v1>" in output
     assert "Rispondi in italiano" in output
+    assert "Tool-call contract" in output
+    assert "<tool_call>" in output
 
 
 def test_resolve_retrieval_mode_auto_follows_prefer_local_tools() -> None:
@@ -80,4 +82,6 @@ def test_cli_doctor_rejects_secret_in_api_key_env(tmp_path, capsys) -> None:
     assert code == 2
     assert secret not in output
     assert "e57a...94a0" in output
+    assert "Provider retries" in output
+    assert "Repo index cache" in output
     assert "must be an environment variable name" in output

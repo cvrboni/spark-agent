@@ -32,6 +32,27 @@ async def test_workspace_tools_reject_path_escape(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_workspace_tools_reject_sensitive_file_reads(tmp_path) -> None:
+    secret = tmp_path / ".env"
+    secret.write_text("TOKEN=secret\n", encoding="utf-8")
+    specs = workspace_tool_specs(tmp_path)
+
+    with pytest.raises(PermissionError, match="sensitive file"):
+        await _handler(specs, "read_file")({"path": ".env"})
+
+
+@pytest.mark.asyncio
+async def test_workspace_tools_reject_internal_file_reads(tmp_path) -> None:
+    internal = tmp_path / ".spark-agent" / "sessions.jsonl"
+    internal.parent.mkdir()
+    internal.write_text("{}", encoding="utf-8")
+    specs = workspace_tool_specs(tmp_path)
+
+    with pytest.raises(PermissionError, match="internal directory"):
+        await _handler(specs, "read_file")({"path": ".spark-agent/sessions.jsonl"})
+
+
+@pytest.mark.asyncio
 async def test_run_command_rejects_non_allowlisted_command(tmp_path) -> None:
     specs = workspace_tool_specs(tmp_path)
 

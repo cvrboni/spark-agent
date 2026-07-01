@@ -23,6 +23,8 @@ class SparkAgentConfig:
     language: str = DEFAULT_LANGUAGE
     timeout_s: float = 120.0
     max_tokens: int = 2048
+    max_retries: int = 1
+    retry_backoff_s: float = 0.25
     repo_context_budget: int = 24_000
     prefer_local_tools: bool = True
     approval_policy: str = "interactive"
@@ -43,6 +45,8 @@ class SparkAgentConfig:
             api_key_env=str(provider.get("api_key_env", "SPARK_AGENT_API_KEY")),
             timeout_s=float(provider.get("timeout_s", 120.0)),
             max_tokens=int(provider.get("max_tokens", 2048)),
+            max_retries=int(provider.get("max_retries", 1)),
+            retry_backoff_s=float(provider.get("retry_backoff_s", 0.25)),
             language=str(agent.get("language", DEFAULT_LANGUAGE)),
             repo_context_budget=int(agent.get("repo_context_budget", 24_000)),
             prefer_local_tools=bool(agent.get("prefer_local_tools", True)),
@@ -60,6 +64,10 @@ class SparkAgentConfig:
             language=os.getenv("SPARK_AGENT_LANGUAGE", config.language),
             timeout_s=float(os.getenv("SPARK_AGENT_TIMEOUT_S", str(config.timeout_s))),
             max_tokens=int(os.getenv("SPARK_AGENT_MAX_TOKENS", str(config.max_tokens))),
+            max_retries=int(os.getenv("SPARK_AGENT_MAX_RETRIES", str(config.max_retries))),
+            retry_backoff_s=float(
+                os.getenv("SPARK_AGENT_RETRY_BACKOFF_S", str(config.retry_backoff_s))
+            ),
             repo_context_budget=int(
                 os.getenv("SPARK_AGENT_REPO_CONTEXT_BUDGET", str(config.repo_context_budget))
             ),
@@ -99,7 +107,9 @@ class SparkAgentConfig:
             f"model = {_toml_string(self.model)}\n"
             f"api_key_env = {_toml_string(self.api_key_env)}\n"
             f"timeout_s = {self.timeout_s:g}\n"
-            f"max_tokens = {self.max_tokens}\n\n"
+            f"max_tokens = {self.max_tokens}\n"
+            f"max_retries = {self.max_retries}\n"
+            f"retry_backoff_s = {self.retry_backoff_s:g}\n\n"
             "[agent]\n"
             f"language = {_toml_string(self.language)} # auto, it, en\n"
             f"repo_context_budget = {self.repo_context_budget}\n"

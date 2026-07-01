@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import httpx
 import pytest
 
 from spark_agent.core.executor import AgentExecutor, VLLMClientConfig
@@ -35,6 +36,21 @@ class FakeClient:
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class FlakyClient:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        self.calls = 0
+
+    async def post(self, _url: str, **_kwargs: Any) -> FakeResponse:
+        self.calls += 1
+        if self.calls == 1:
+            raise httpx.ConnectError("temporary local provider outage")
+        return FakeResponse(self.payload)
+
+    async def aclose(self) -> None:
+        return None
 
 
 @pytest.mark.asyncio
@@ -145,6 +161,64 @@ def test_executor_respects_context_budget_for_tool_results() -> None:
 
 
 @pytest.mark.asyncio
+async def test_executor_validates_tool_arguments_before_handler() -> None:
+    prompt = PromptEngine(static_blocks=[PromptBlock("system", "stable")])
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_bad",
+                            "function": {
+                                "name": "strict_tool",
+                                "arguments": {"path": "README.md", "extra": True},
+                            },
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+    called = False
+
+    async def handler(arguments: dict[str, Any]) -> dict[str, Any]:
+        nonlocal called
+        called = True
+        return {"ok": True, "arguments": arguments}
+
+    executor = AgentExecutor(
+        prompt_engine=prompt,
+        config=VLLMClientConfig(),
+        tools=[
+            ToolSpec(
+                name="strict_tool",
+                definition={
+                    "type": "function",
+                    "function": {
+                        "name": "strict_tool",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                handler=handler,
+            )
+        ],
+        client=FakeClient(payload),  # type: ignore[arg-type]
+    )
+
+    await executor.step()
+
+    assert called is False
+    assert "unexpected arguments" in prompt.dynamic_events[-1]["content"]
+
+
+@pytest.mark.asyncio
 async def test_executor_sends_bearer_auth_header() -> None:
     prompt = PromptEngine(static_blocks=[PromptBlock("system", "stable")])
     payload = {"choices": [{"message": {"content": "ok"}}]}
@@ -163,3 +237,19 @@ async def test_executor_sends_bearer_auth_header() -> None:
 
     assert client.last_url == "http://llm.example:8000/v1/chat/completions"
     assert client.last_headers == {"Authorization": "Bearer secret"}
+
+
+@pytest.mark.asyncio
+async def test_executor_retries_transient_network_errors() -> None:
+    prompt = PromptEngine(static_blocks=[PromptBlock("system", "stable")])
+    client = FlakyClient({"choices": [{"message": {"content": "ok"}}]})
+    executor = AgentExecutor(
+        prompt_engine=prompt,
+        config=VLLMClientConfig(max_retries=1, retry_backoff_s=0),
+        client=client,  # type: ignore[arg-type]
+    )
+
+    turn = await executor.step()
+
+    assert turn.content == "ok"
+    assert client.calls == 2

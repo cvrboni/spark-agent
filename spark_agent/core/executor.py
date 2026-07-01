@@ -10,8 +10,10 @@ from typing import Any
 import httpx
 
 from spark_agent.core.approval import ApprovalPolicy, request_approval
+from spark_agent.core.model_adapter import ModelAdapter, ModelAdapterError
 from spark_agent.core.prompt_engine import JsonValue, PromptEngine
 from spark_agent.core.streaming import collect_streamed_completion
+from spark_agent.core.tool_validation import validate_tool_arguments
 from spark_agent.core.types import JsonObject, ToolSpec
 
 type TokenCallback = Callable[[str], None]
@@ -35,6 +37,8 @@ class VLLMClientConfig:
     repo_context_budget: int | None = None
     approval_policy: ApprovalPolicy = ApprovalPolicy.INTERACTIVE
     approval_interactive: bool = True
+    max_retries: int = 1
+    retry_backoff_s: float = 0.25
 
     @property
     def chat_completions_url(self) -> str:
@@ -156,28 +160,47 @@ class AgentExecutor:
         return await self._chat_completion_json(payload), None
 
     async def _chat_completion_json(self, payload: JsonObject) -> JsonObject:
-        try:
-            response = await self._client.post(
-                self.config.chat_completions_url,
-                json=payload,
-                headers=self.config.headers,
-            )
-            response.raise_for_status()
-            return response.json()
-        except httpx.TimeoutException as exc:
-            raise VLLMRequestError(
-                f"vLLM request timed out after {self.config.timeout_s:g}s ({type(exc).__name__})"
-            ) from exc
-        except httpx.NetworkError as exc:
-            detail = str(exc) or type(exc).__name__
-            raise VLLMRequestError(f"vLLM network error: {detail}") from exc
-        except httpx.HTTPStatusError as exc:
-            body = exc.response.text[:1000]
-            raise VLLMRequestError(
-                f"vLLM returned HTTP {exc.response.status_code}: {body}"
-            ) from exc
-        except json.JSONDecodeError as exc:
-            raise VLLMRequestError("vLLM returned invalid JSON") from exc
+        attempts = max(1, self.config.max_retries + 1)
+        for attempt in range(attempts):
+            try:
+                response = await self._client.post(
+                    self.config.chat_completions_url,
+                    json=payload,
+                    headers=self.config.headers,
+                )
+                response.raise_for_status()
+                return response.json()
+            except httpx.TimeoutException as exc:
+                if await self._retry_if_available(attempt, attempts):
+                    continue
+                raise VLLMRequestError(
+                    f"vLLM request timed out after {self.config.timeout_s:g}s ({type(exc).__name__})"
+                ) from exc
+            except httpx.NetworkError as exc:
+                if await self._retry_if_available(attempt, attempts):
+                    continue
+                detail = str(exc) or type(exc).__name__
+                raise VLLMRequestError(f"vLLM network error: {detail}") from exc
+            except httpx.HTTPStatusError as exc:
+                if _is_retryable_http_status(exc.response.status_code) and await self._retry_if_available(
+                    attempt, attempts
+                ):
+                    continue
+                body = exc.response.text[:1000]
+                raise VLLMRequestError(
+                    f"vLLM returned HTTP {exc.response.status_code}: {body}"
+                ) from exc
+            except json.JSONDecodeError as exc:
+                raise VLLMRequestError("vLLM returned invalid JSON") from exc
+        raise VLLMRequestError("vLLM request failed after retries")
+
+    async def _retry_if_available(self, attempt: int, attempts: int) -> bool:
+        if attempt >= attempts - 1:
+            return False
+        backoff = max(0.0, self.config.retry_backoff_s) * (2 ** attempt)
+        if backoff:
+            await asyncio.sleep(backoff)
+        return True
 
     async def _chat_completion_stream(
         self,
@@ -249,14 +272,15 @@ class AgentExecutor:
 
     @staticmethod
     def _message_to_turn(message: Mapping[str, Any]) -> AgentTurn:
-        tool_calls = message.get("tool_calls") or ()
-        if not isinstance(tool_calls, Sequence) or isinstance(tool_calls, str):
-            raise VLLMRequestError("tool_calls must be a sequence")
+        try:
+            normalized = ModelAdapter().normalize_message(message)
+        except ModelAdapterError as exc:
+            raise VLLMRequestError(str(exc)) from exc
         return AgentTurn(
-            content=message.get("content"),
-            reasoning_content=message.get("reasoning_content") or message.get("reasoning"),
-            tool_calls=tuple(dict(tool_call) for tool_call in tool_calls),
-            raw_message=dict(message),
+            content=normalized.content,
+            reasoning_content=normalized.reasoning_content,
+            tool_calls=normalized.tool_calls,
+            raw_message=normalized.raw_message,
         )
 
     async def _execute_tool_calls(self, tool_calls: Sequence[JsonObject]) -> None:
@@ -277,6 +301,7 @@ class AgentExecutor:
 
             try:
                 arguments = self._decode_arguments(function.get("arguments", {}))
+                arguments = validate_tool_arguments(name, spec.definition, arguments)
             except Exception as exc:
                 results[index] = (tool_call_id, name, {"error": f"{type(exc).__name__}: {exc}"})
                 return
@@ -350,3 +375,7 @@ class AgentExecutor:
             "max_chars": max_chars,
             "preview": rendered[:max_chars],
         }
+
+
+def _is_retryable_http_status(status_code: int) -> bool:
+    return status_code in {408, 409, 425, 429, 500, 502, 503, 504}

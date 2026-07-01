@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import asyncio
-import shlex
 from pathlib import Path
 from typing import Any
 
+from spark_agent.core.sandbox import LocalSandbox, validate_read_path
 from spark_agent.core.types import ToolSpec
 
 type JsonObject = dict[str, Any]
@@ -149,6 +148,7 @@ async def _read_file_handler(arguments: JsonObject, root: Path) -> JsonObject:
     path = _resolve_under_root(root, str(arguments["path"]))
     if not path.is_file():
         raise FileNotFoundError(str(path))
+    validate_read_path(path, root)
     max_bytes = max(1024, min(int(arguments.get("max_bytes", DEFAULT_MAX_BYTES)), 250_000))
     data = path.read_bytes()[:max_bytes]
     text = data.decode("utf-8", errors="replace")
@@ -162,25 +162,10 @@ async def _read_file_handler(arguments: JsonObject, root: Path) -> JsonObject:
 
 async def _apply_patch_handler(arguments: JsonObject, root: Path) -> JsonObject:
     patch = str(arguments["patch"])
-    if not patch.strip():
-        raise ValueError("patch must be non-empty")
-    process = await asyncio.create_subprocess_exec(
-        "git",
-        "apply",
-        "--whitespace=nowarn",
-        "--",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=root,
-    )
-    stdout, stderr = await process.communicate(patch.encode("utf-8"))
-    return {
-        "ok": process.returncode == 0,
-        "returncode": process.returncode,
-        "stdout": stdout.decode("utf-8", errors="replace")[:4000],
-        "stderr": stderr.decode("utf-8", errors="replace")[:4000],
-    }
+    result = await LocalSandbox(root).apply_patch(patch)
+    payload = result.to_json(stdout_chars=4000, stderr_chars=4000)
+    payload["ok"] = result.returncode == 0
+    return payload
 
 
 async def _run_command_handler(arguments: JsonObject, root: Path) -> JsonObject:
@@ -188,43 +173,9 @@ async def _run_command_handler(arguments: JsonObject, root: Path) -> JsonObject:
     if not isinstance(raw_command, list) or not all(isinstance(item, str) for item in raw_command):
         raise ValueError("command must be a list of strings")
     command = [str(item) for item in raw_command]
-    _validate_command(command)
     timeout_s = max(1.0, min(float(arguments.get("timeout_s", DEFAULT_TIMEOUT_S)), 120.0))
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=root,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_s)
-    except TimeoutError as exc:
-        process.kill()
-        await process.wait()
-        raise TimeoutError(f"command timed out after {timeout_s:g}s: {shlex.join(command)}") from exc
-    return {
-        "command": command,
-        "returncode": process.returncode,
-        "stdout": stdout.decode("utf-8", errors="replace")[:12000],
-        "stderr": stderr.decode("utf-8", errors="replace")[:12000],
-    }
-
-
-def _validate_command(command: list[str]) -> None:
-    allowed_prefixes = (
-        ("git", "status"),
-        ("git", "diff"),
-        ("python", "-m", "pytest"),
-        ("python", "-m", "compileall"),
-        ("python3", "-m", "pytest"),
-        ("python3", "-m", "compileall"),
-        ("python3.13", "-m", "pytest"),
-        ("python3.13", "-m", "compileall"),
-        ("pytest",),
-        ("ruff", "check"),
-    )
-    if not any(tuple(command[: len(prefix)]) == prefix for prefix in allowed_prefixes):
-        raise PermissionError(f"command is not allowlisted: {shlex.join(command)}")
+    result = await LocalSandbox(root).run_command(command, timeout_s=timeout_s)
+    return result.to_json(stdout_chars=12000, stderr_chars=12000)
 
 
 def _resolve_under_root(root: Path, value: str) -> Path:
